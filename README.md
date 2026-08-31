@@ -1,67 +1,122 @@
 # Forge Data
 
-**A production-grade data pipeline platform for robotics, physical AI, and multimodal sensor data.**
+<!-- No banner asset is committed to this repository yet. -->
 
-[中文版 README](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
+**Reproducible data infrastructure for robotics and Physical AI.**
 
-Raw sensor files in, versioned, reproducible, lineage-tracked ML-ready datasets out —
-across 10 independently-testable stages, with a governance layer that ties them all together.
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
+![Tests](https://img.shields.io/badge/tests-878%20passing-brightgreen)
 
+[中文文档](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
+
+Forge Data turns raw, heterogeneous sensor streams into validated, synchronized,
+quality-controlled, lineage-tracked ML datasets. It is built for robotics and Physical AI
+workflows, where independently-clocked streams like IMU and GPS have to move through
+deterministic, auditable preprocessing before they're trainable — and where you need to be
+able to answer "where did this exact dataset come from?" months later.
+
+## Why Forge Data?
+
+Robotics and multimodal sensor data has a set of problems that generic ML data tooling
+doesn't address well:
+
+- **Heterogeneous formats and inconsistent units** — one file in `g`, another in `m/s²`, a third with no unit recorded at all.
+- **Independent clocks** — IMU and GPS streams drift relative to each other and need explicit temporal alignment, not a naive join.
+- **Missing modalities and quality issues** — a sensor drops out mid-session; a bad batch shouldn't silently poison a dataset.
+- **Overlapping windows and leakage** — feature-extraction windows that share source rows must never land on both sides of a train/test split.
+- **Reproducibility and lineage** — "which raw files, which config, which code version produced this exact package?" needs a real answer, not a guess.
+
+Forge Data's approach:
+
+- **Immutable artifacts** — every stage writes once; a changed input produces a new artifact, never an in-place edit.
+- **SHA-256 lineage everywhere** — every artifact and manifest is checksummed, and every stage records its upstream parent explicitly.
+- **Deterministic transformations** — normalization, windowing, and splitting are configuration- and seed-driven, not incidental.
+- **Explicit stage boundaries** — validation, integrity, normalization, synchronization, cleaning, and QC are separate, independently testable services.
+- **Leakage-safe dataset packaging** — samples are grouped by source overlap *before* any split decision is made.
+- **A reconstructible metadata catalog** — a SQLite index over the pipeline's own manifests, never a second source of truth.
+
+## Pipeline overview
+
+```mermaid
+flowchart TD
+    subgraph imu["IMU stream (built-in example)"]
+        A1[Ingestion] --> A2[Schema Validation] --> A3[Integrity] --> A4[Normalization]
+    end
+    subgraph gps["GPS stream (built-in example)"]
+        B1[Ingestion] --> B2[Schema Validation] --> B3[Integrity] --> B4[Normalization]
+    end
+    A4 --> SYNC[Synchronization]
+    B4 --> SYNC
+    SYNC --> CLEAN[Cleaning]
+    CLEAN --> XFORM[Transformation]
+    XFORM --> QC[Dataset QC]
+    QC --> PKG[Packaging]
+    PKG --> CAT[Catalog · Dataset Registry · Global Lineage]
 ```
-Status: 10 / 10 stages complete · 878 tests passing · FastAPI + Pydantic v2 + SQLite
-```
 
----
+IMU and GPS are the schemas and normalization profiles shipped with the repository today;
+the ingestion → validation → integrity → normalization chain, synchronization's multi-stream
+alignment, and the catalog's lineage graph are all schema-agnostic and designed to take
+additional sensor types without changes to earlier stages.
 
-## Why this exists
+## Core capabilities
 
-Robotics and physical-AI teams generate messy, multi-sensor time-series data (IMU, GPS, and more)
-that has to survive a long trip before it's trainable: ingest it safely, validate it, check its
-integrity, normalize units, synchronize streams that drift out of clock alignment, clean and
-filter it, turn it into model-ready features, run dataset-level QC, package it into versioned
-train/val/test splits — and, after all that, still be able to answer *"where did this exact
-package come from, and can I reproduce it?"*
-
-**Forge Data implements the whole chain as one coherent, incrementally-built platform** — every
-stage is a bounded, independently testable service; nothing is a notebook script; every artifact
-is immutable, checksummed, and traceable back to its raw source.
-
-## The pipeline
-
-```
- raw upload          schema        data           unit          multi-stream       filter /        feature          dataset            versioned
- (IMU / GPS)   -->   validation -> integrity   -> normalization -> synchronization -> cleaning ->  extraction   ->  QC          -->    package   --+
-   Step 1            Step 2        Step 3          Step 4           Step 5            Step 6         Step 7           Step 8           Step 9      |
-                                                                                                                                                     v
-                                            +------------------------------------------------------------------------------------------------------+
-                                            |
-                                            v
-                          Step 10 — Catalog, Global Lineage & Dataset Registry (SQLite index over every manifest above)
-```
-
-Every stage writes an immutable, checksummed artifact + manifest to its own storage root.
-Step 10 never rewrites, reruns, or repairs any of them — it only reads, indexes, and verifies.
-
-| # | Stage | What it does |
+| Stage | Responsibility | Key guarantees / output |
 |---|---|---|
-| 1 | **Ingestion** | Immutable raw upload, streamed SHA-256 hashing, no in-place overwrite |
-| 2 | **Schema Validation** | Per-record schema conformance (IMU / GPS), structured error reports |
-| 3 | **Data Integrity** | Deeper semantic/range/consistency checks beyond schema shape |
-| 4 | **Normalization** | Canonical units + timestamps, pluggable per-schema profiles |
-| 5 | **Synchronization** | Aligns independently-clocked streams (IMU + GPS...) onto one timeline |
-| 6 | **Cleaning** | Deterministic filtering, deduplication, redaction policies |
-| 7 | **Transformation** | Deterministic windowing + handcrafted feature generation |
-| 8 | **Dataset QC** | Distribution/coverage/drift checks over a whole transformed dataset |
-| 9 | **Packaging** | Leakage-safe, group-aware train/val/test splits, framework-neutral export |
-| 10 | **Catalog & Lineage** | Cross-stage DAG, dataset registry, immutable SemVer versions, reproducibility fingerprint |
+| **Ingestion** | Immutable raw upload | Streamed SHA-256 hashing, write-once storage, manifest per upload |
+| **Schema Validation** | Per-record schema conformance | Structured error/warning reports; built-in IMU and GPS schemas |
+| **Integrity** | Semantic/range/consistency checks | Deeper than schema shape — extreme values, ordering, per-schema checkers |
+| **Normalization** | Canonical units and UTC timestamps | Deterministic derived artifact; pluggable per-schema profiles |
+| **Synchronization** | Temporal alignment across streams | Nearest / linear-interpolation alignment, configurable tolerance, explicit clock correction |
+| **Cleaning** | Filtering and redaction | Deterministic drop/redact policies, coverage and duplicate rules |
+| **Transformation** | Feature extraction | Deterministic count/time windowing, handcrafted statistical + derived features |
+| **Dataset QC** | Dataset-level quality control | Modality coverage, feature completeness, variance, and drift checks |
+| **Packaging** | Train/validation/test generation | Group-aware, leakage-safe deterministic splitting; JSONL (+ optional Parquet) export |
+| **Catalog** | Global lineage and dataset registry | SQLite index, rebuildable from filesystem manifests; dataset registry with immutable SemVer versions |
 
-## Engineering principles
+## Data flow example
 
-- **Immutable by construction** — every artifact is write-once; a change means a new ID, never an in-place edit.
-- **Filesystem is the source of truth** — SQLite (introduced only at Step 10) is a rebuildable *index*, never the record of truth.
-- **Fail loud, never silently repair** — validation, QC, and lineage verification report problems; nothing auto-fixes them.
-- **Deterministic everywhere** — splitting, fingerprinting, and feature generation are seed-driven and reproducible, never random-by-default.
-- **Every stage independently testable** — 878 tests, no stage's tests depend on another stage's runtime state.
+```
+Input:            imu.csv, gps.csv
+
+Pipeline:         upload → validate → integrity → normalize → synchronize
+                   → clean → transform → QC → package
+
+Output:           train.jsonl
+                   validation.jsonl
+                   test.jsonl
+                   split_index.jsonl
+                   manifest.json          (per stage, at every step)
+                   + lineage recorded in the catalog, traceable back to imu.csv / gps.csv
+```
+
+The full curl-by-curl walkthrough lives in the [Full Technical Guide](docs/DETAILED_GUIDE.md#end-to-end-demo).
+
+## Design guarantees
+
+**Immutable artifacts** — stages never rewrite upstream outputs. A raw upload, a validation
+report, a normalized artifact, a package — once written, none of them are ever edited or
+overwritten by a later stage.
+
+**Deterministic execution** — normalization, windowing, and dataset splitting are driven by
+explicit configuration and seeds, not incidental runtime state. Two independent runs over the
+same bytes and configuration produce the same derived artifacts and the same reproducibility
+fingerprint.
+
+**Explicit lineage** — every artifact carries the ID and SHA-256 of its upstream parent(s).
+The catalog turns this into an explicit parent → child DAG rather than an implied ordering.
+
+**Separation of concerns** — schema validation, integrity checking, normalization,
+synchronization, cleaning, and QC are deliberately separate services with their own storage
+roots and their own test suites, not phases of one monolithic job.
+
+**Leakage-safe packaging** — Step 7's overlapping feature windows are grouped by source-row
+overlap *before* Step 9 makes any train/validation/test split decision, so no split can ever
+divide a group of overlapping samples across partitions.
+
+**Rebuildable catalog** — the SQLite catalog is an index, not a source of truth. It can be
+deleted and fully reconstructed from the filesystem manifests any stage already writes.
 
 ## Quick start
 
@@ -71,44 +126,147 @@ cd forge-data
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-uvicorn app.main:app --reload   # http://localhost:8000
-pytest                          # 878 tests
+uvicorn app.main:app --reload
+pytest
 ```
 
-Minimal end-to-end taste (full walkthrough in the [Full Technical Guide](docs/DETAILED_GUIDE.md)):
+Interactive API docs (Swagger UI) are served at **http://localhost:8000/docs** — every
+endpoint can be explored and called from the browser without writing a single curl command.
+
+Minimal example — upload a raw file:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingestion/upload \
   -F "file=@imu.csv" -F "customer_id=demo" -F "device_id=imu_001"
-# -> { "ingestion_id": "ing_...", "status": "stored", ... }
-
-curl -X POST http://localhost:8000/api/v1/catalog/rebuild   # index everything indexed so far
-curl http://localhost:8000/api/v1/catalog/health            # -> { "status": "healthy", ... }
+# -> { "ingestion_id": "ing_...", "status": "stored", "sha256": "...", ... }
 ```
 
-## Tech stack
+The full 10-stage curl walkthrough is in the [Full Technical Guide](docs/DETAILED_GUIDE.md).
 
-Python 3.12+ · FastAPI · Pydantic v2 · pytest · stdlib `sqlite3` (no ORM) · local filesystem storage
-(pluggable — the storage abstraction is designed for S3/GCS/Azure Blob backends later).
+## API surface
 
-## Project layout
+| Group | Prefix | Purpose |
+|---|---|---|
+| Ingestion | `/api/v1/ingestion` | Raw upload, immutable storage |
+| Validation | `/api/v1/validation` | Per-record schema validation |
+| Integrity | `/api/v1/integrity` | Semantic/range/consistency checks |
+| Normalization | `/api/v1/normalization` | Canonical units and timestamps |
+| Synchronization | `/api/v1/synchronization` | Multi-stream temporal alignment |
+| Cleaning | `/api/v1/cleaning` | Filtering, deduplication, redaction |
+| Transformation | `/api/v1/transformation` | Windowing and feature extraction |
+| QC | `/api/v1/qc` | Dataset-level quality control |
+| Packaging | `/api/v1/packaging` | Train/validation/test packaging and export |
+| Catalog | `/api/v1/catalog` | Scan, rebuild, health, artifact lookup, verification |
+| Lineage | `/api/v1/lineage` | Upstream/downstream traversal, impact analysis |
+| Datasets | `/api/v1/datasets` | Dataset registry, versions, reproducibility |
+
+Full endpoint reference, request/response shapes, and error codes: [Full Technical Guide](docs/DETAILED_GUIDE.md).
+
+## Output structure
+
+```
+data/
+  raw/            Immutable original uploads + manifests
+  validation/     Schema validation reports
+  integrity/      Integrity check reports
+  normalized/     Canonical-unit artifacts
+  synchronized/   Time-aligned multi-stream artifacts
+  cleaned/        Filtered/redacted artifacts
+  transformed/    Windowed feature artifacts
+  qc/             Dataset QC reports
+  packages/       Versioned train/validation/test packages
+  catalog/        SQLite metadata catalog (catalog.db)
+```
+
+Runtime contents of every directory above are excluded from version control except a
+`.gitkeep` placeholder — `data/` is regenerated by running the pipeline, never committed.
+
+## Dataset versioning and lineage
+
+A dataset version is an immutable pointer to exactly one package, with the full upstream
+chain reconstructible from the catalog:
+
+```
+robotics_demo @ 1.0.0
+      └─ package
+            ├─ transformation
+            │     └─ cleaning
+            │           └─ synchronization
+            │                 ├─ IMU normalization
+            │                 └─ GPS normalization
+            │                       └─ raw ingestions
+            └─ QC report
+```
+
+- Registering a version against a *different* package than the one it already points to is
+  rejected outright (`409 DATASET_VERSION_IMMUTABLE`) — a version is a permanent pointer.
+- `POST /api/v1/catalog/verify/{type}/{id}?recursive=true` recomputes checksums for an
+  artifact and its entire upstream lineage in one call.
+- `GET /api/v1/datasets/{name}/versions/{version}/reproducibility` returns every content
+  and config hash behind a package plus a single **lineage fingerprint** — a SHA-256 over
+  that hash set, excluding execution IDs and timestamps, so two independent runs over
+  equivalent data and configuration produce the identical fingerprint.
+- `GET /api/v1/lineage/{type}/{id}/impact` reports downstream impact — what breaks, and
+  which dataset versions are affected, if a given upstream artifact turns out to be bad.
+
+## Testing
+
+878 tests currently cover per-stage behavior, lineage gates, determinism, artifact
+immutability, checksum validation, API contracts, and full end-to-end pipeline runs.
+
+```bash
+pytest
+```
+
+## Project structure
 
 ```
 app/
-    ingestion/ validation/ integrity/ normalization/    Steps 1-4
-    synchronization/ cleaning/ transformation/            Steps 5-7
-    qc/ packaging/                                        Steps 8-9
-    catalog/                                               Step 10 — index, lineage, verification, dataset registry
-    storage/         Per-stage immutable artifact stores + SQLite catalog store
-    api/routes/       Thin HTTP layer — one router per stage
-tests/                878 tests, one or more files per stage
+  ingestion/ validation/ integrity/ normalization/   Per-stage services
+  synchronization/ cleaning/ transformation/
+  qc/ packaging/
+  catalog/            Lineage graph, verification, dataset registry, SQLite catalog
+  storage/            Immutable artifact stores (one per stage) + catalog store
+  api/routes/         FastAPI routers, one per stage
+tests/                878 tests
 schemas/              Built-in IMU / GPS schema definitions
-docs/DETAILED_GUIDE.md   Full technical reference (architecture, API tables, error codes, MVP limitations)
+docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
 ```
 
-## Status
+## Current scope
 
-All 10 planned stages are complete, tested, and demoed end-to-end against a live server.
-No Step 11 work has started — see [Full Technical Guide § Deliberate MVP limitations](docs/DETAILED_GUIDE.md#deliberate-mvp-limitations)
-for what's deliberately out of scope today (no cloud storage backends, no auth/RBAC, no distributed
-execution, single-process SQLite only, and more).
+**Implemented:**
+- Local filesystem–backed pipeline, end to end (ingestion through packaging and catalog)
+- IMU and GPS as built-in schema/normalization-profile examples
+- FastAPI HTTP API with interactive Swagger docs
+- Deterministic processing, dataset QC, and leakage-safe packaging
+- SQLite-backed metadata catalog, rebuildable from filesystem manifests
+
+**Deliberately not implemented yet:**
+- Cloud object storage backends (S3 / GCS / Azure Blob)
+- Authentication, authorization, or multi-tenancy
+- Distributed or orchestrated execution
+- A web dashboard
+- Automatic sensor schema inference
+- A production-grade (non-SQLite) database deployment
+
+## Roadmap
+
+Realistic next steps, not commitments or dates:
+
+- Pluggable cloud storage backends
+- Pipeline job orchestration and run history
+- Authentication and workspace isolation
+- A web dashboard over the catalog and lineage graph
+- Richer robotics connectors (e.g. ROS bag ingestion)
+- Production observability (metrics, structured tracing)
+
+## Documentation
+
+- [Full Technical Guide](docs/DETAILED_GUIDE.md) — architecture, every API and error code, per-stage design notes, MVP limitations
+- [中文文档](README.zh-CN.md)
+
+## Contributing
+
+This project doesn't yet have a formal contribution process — if you're interested in
+contributing, open an issue to discuss what you have in mind before sending a pull request.
