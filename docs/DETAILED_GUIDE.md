@@ -2,11 +2,12 @@
 
 > This is the complete, stage-by-stage engineering reference (architecture,
 > every API, every error code, every MVP limitation, per-step demos). For a
-> quick overview, start with the project [README](../README.md) instead.
+> quick overview, start with the project README instead:
+> [English](../README.md) · [中文](../README.zh-CN.md).
 >
 > 本文档是完整的分阶段工程参考手册（架构设计、全部 API、错误码、MVP 限制、
-> 各步骤演示）。如果只想快速了解项目概况，请先看根目录的
-> [README](../README.md)。
+> 各步骤演示）。如果只想快速了解项目概况，请先看根目录的 README：
+> [English](../README.md) · [中文](../README.zh-CN.md)。
 
 A pipeline platform for robotics / physical AI / multimodal sensor data,
 built incrementally, one bounded stage at a time.
