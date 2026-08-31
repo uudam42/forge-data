@@ -1,20 +1,34 @@
 # Forge Data
 
-<!-- No banner asset is committed to this repository yet. -->
-
 **Reproducible data infrastructure for robotics and Physical AI.**
+
+**v1.0** · English · [中文](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
 
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![Tests](https://img.shields.io/badge/tests-878%20passing-brightgreen)
 
-[中文文档](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
+<!-- No banner asset is committed to this repository yet. -->
 
 Forge Data turns raw, heterogeneous sensor streams into validated, synchronized,
-quality-controlled, lineage-tracked ML datasets. It is built for robotics and Physical AI
-workflows, where independently-clocked streams like IMU and GPS have to move through
-deterministic, auditable preprocessing before they're trainable — and where you need to be
-able to answer "where did this exact dataset come from?" months later.
+quality-controlled, leakage-safe, lineage-tracked datasets for machine learning. It is built
+for robotics and Physical AI workflows, where independently-clocked streams like IMU and GPS
+have to move through deterministic, auditable preprocessing before they're trainable — and
+where you need to be able to answer "where did this exact dataset come from?" months later.
+
+## Forge Data v1.0
+
+v1.0 is the first complete release of the local core pipeline — a single, coherent chain
+from raw upload to a versioned, lineage-tracked dataset:
+
+```
+Ingestion → Validation → Integrity → Normalization → Synchronization
+   → Cleaning → Transformation → Dataset QC → Packaging
+   → Global Lineage & Dataset Registry
+```
+
+Every stage in that chain is implemented, tested, and wired together end to end — see
+[Status](#status) for what that guarantees today and what's intentionally out of scope.
 
 ## Why Forge Data?
 
@@ -232,6 +246,23 @@ tests/                878 tests
 schemas/              Built-in IMU / GPS schema definitions
 docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
 ```
+
+## Status
+
+**Current release: Forge Data v1.0**
+
+The v1.0 core pipeline is complete and validated end-to-end, with:
+
+- immutable per-stage artifacts
+- deterministic transformations
+- dataset-level QC
+- leakage-safe packaging
+- global lineage
+- a dataset version registry
+
+The current implementation is **local-first and single-node**. Cloud storage, orchestration,
+authentication, multi-tenancy, and a web dashboard are planned for the next phase — see
+[Roadmap](#roadmap).
 
 ## Current scope
 
