@@ -1,0 +1,34 @@
+[project]
+name = "ai-data-pipeline"
+version = "0.1.0"
+description = "Ingestion layer MVP for a robotics / physical AI / multimodal sensor data pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+# Parquet export (Step 9) is optional — the base install works fully
+# without it; requesting a "parquet" export without this extra returns a
+# clear 400 UNSUPPORTED_EXPORT_FORMAT instead of crashing.
+parquet = [
+    "pyarrow>=15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

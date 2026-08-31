@@ -1,0 +1,42 @@
+{
+  "schema_name": "gps",
+  "schema_version": "1.0.0",
+  "record_type": "tabular",
+  "fields": {
+    "timestamp": {
+      "type": "datetime",
+      "required": true,
+      "nullable": false,
+      "format": "iso8601"
+    },
+    "latitude": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "longitude": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "altitude": {
+      "type": "float",
+      "required": false,
+      "nullable": true
+    },
+    "speed": {
+      "type": "float",
+      "required": false,
+      "nullable": true
+    },
+    "device_id": {
+      "type": "string",
+      "required": false,
+      "nullable": true
+    }
+  },
+  "allow_extra_fields": false,
+  "metadata_requirements": {
+    "sensor_type": "gps"
+  }
+}
