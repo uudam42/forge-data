@@ -1,3 +1,5 @@
+<img width="2172" height="724" alt="ChatGPT Image Aug 31, 2026, 09_54_18 AM" src="https://github.com/user-attachments/assets/b5627c0f-0fcc-4871-96aa-43fb13c52c94" />
+
 # Forge Data
 
 **Reproducible data infrastructure for robotics and Physical AI.**
