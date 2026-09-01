@@ -13,6 +13,7 @@ from app.api.routes.lineage import router as lineage_router
 from app.api.routes.normalization import router as normalization_router
 from app.api.routes.packaging import router as packaging_router
 from app.api.routes.qc import router as qc_router
+from app.api.routes.recovery import router as recovery_router
 from app.api.routes.synchronization import router as synchronization_router
 from app.api.routes.transformation import router as transformation_router
 from app.api.routes.validation import router as validation_router
@@ -32,7 +33,9 @@ app = FastAPI(
         "Step 2: schema validation, Step 3: data integrity checks, Step 4: normalization, "
         "Step 5: multimodal synchronization, Step 6: cleaning/filtering, "
         "Step 7: transformation/feature generation, Step 8: dataset QC, "
-        "Step 9: dataset packaging/export, Step 10: versioning + global lineage catalog)."
+        "Step 9: dataset packaging/export, Step 10: versioning + global lineage catalog). "
+        "v2.1 adds crash-safe, atomically-published artifacts and a staging recovery service "
+        "across every stage's storage layer — a cross-cutting reliability upgrade, not a new stage."
     ),
     version="0.10.0",
 )
@@ -49,6 +52,7 @@ app.include_router(packaging_router)
 app.include_router(catalog_router)
 app.include_router(lineage_router)
 app.include_router(datasets_router)
+app.include_router(recovery_router)
 
 
 @app.get("/health", response_model=HealthResponse)

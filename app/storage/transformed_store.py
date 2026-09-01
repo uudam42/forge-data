@@ -18,8 +18,10 @@ project's storage layer.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
+
+from app.storage.atomic import commit_staging_dir, create_staging_dir, discard_staging_dir
+from app.storage.errors import ArtifactDestinationExistsError
 
 _MANIFEST_FILENAME = "manifest.json"
 _REPORT_FILENAME = "report.json"
@@ -65,33 +67,39 @@ class TransformedArtifactStore:
 
 
 class LocalTransformedArtifactStore(TransformedArtifactStore):
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, fsync_enabled: bool = True) -> None:
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
+        self._fsync_enabled = fsync_enabled
 
     def _cleaning_dir(self, cleaning_id: str) -> Path:
         return self._root / cleaning_id
 
     def staging_dir(self, *, cleaning_id: str, transformation_id: str) -> Path:
         staging = self._cleaning_dir(cleaning_id) / f".tmp-{transformation_id}"
-        # exist_ok=False: transformation_id is UUID4, so a collision should
-        # never happen — fail safe rather than write into a stale directory.
-        staging.mkdir(parents=True, exist_ok=False)
+        final_dir = self._cleaning_dir(cleaning_id) / transformation_id
+        # exist_ok=False (enforced inside create_staging_dir):
+        # transformation_id is UUID4, so a collision should never happen —
+        # fail safe rather than write into a stale directory.
+        create_staging_dir(
+            staging,
+            operation_id=transformation_id,
+            artifact_id=transformation_id,
+            stage="transformation",
+            final_destination=final_dir,
+        )
         return staging
 
     def commit(self, *, cleaning_id: str, transformation_id: str, staging_dir: Path) -> str:
         final_dir = self._cleaning_dir(cleaning_id) / transformation_id
-        if final_dir.exists():
-            raise TransformedArtifactAlreadyExistsError(f"Transformation run already exists: {final_dir}")
-
-        # Path.rename() is atomic when source and destination share a
-        # filesystem, which they always do here (both under the same
-        # per-cleaning directory).
-        staging_dir.rename(final_dir)
+        try:
+            commit_staging_dir(staging_dir, final_dir, fsync_enabled=self._fsync_enabled)
+        except ArtifactDestinationExistsError as exc:
+            raise TransformedArtifactAlreadyExistsError(f"Transformation run already exists: {final_dir}") from exc
         return f"file://{final_dir.resolve()}"
 
     def discard(self, staging_dir: Path) -> None:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        discard_staging_dir(staging_dir)
 
     def exists(self, *, cleaning_id: str, transformation_id: str) -> bool:
         return (self._cleaning_dir(cleaning_id) / transformation_id).exists()

@@ -79,6 +79,26 @@ def test_write_manifest_raises_if_already_written(tmp_path: Path) -> None:
         storage.write_manifest(customer_id="c", session_id="s", ingestion_id="i", manifest={"a": 2})
 
 
+def test_save_reads_in_bounded_chunks_never_the_whole_stream_at_once(tmp_path: Path) -> None:
+    """v2.1's staging rewrite must not regress the pre-existing streaming
+    guarantee: save() must never call stream.read() with no size limit
+    (which would buffer an arbitrarily large upload fully in memory)."""
+    storage = _storage(tmp_path)
+    content = b"x" * (5 * 1024 * 1024)  # 5 MiB, several times the write chunk size
+
+    class _BoundedReadStream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:  # noqa: A003
+            if size is None or size < 0:
+                raise AssertionError("save() must always request a bounded chunk size, never a full read")
+            return super().read(size)
+
+    result = storage.save(
+        customer_id="c", session_id="s", ingestion_id="i", filename="big.bin", stream=_BoundedReadStream(content)
+    )
+    assert result.size_bytes == len(content)
+    assert result.sha256 == hashlib.sha256(content).hexdigest()
+
+
 def test_anonymous_customer_uses_literal_directory(tmp_path: Path) -> None:
     storage = _storage(tmp_path)
     storage.save(customer_id="anonymous", session_id="s", ingestion_id="i", filename="a.json", stream=io.BytesIO(b"{}"))

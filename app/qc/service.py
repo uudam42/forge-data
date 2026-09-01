@@ -47,6 +47,7 @@ from app.qc.models import (
 )
 from app.qc.registry import QCProfileRegistry
 from app.qc.serialization import canonical_json, compute_report_sha256
+from app.storage.atomic import write_manifest_file
 from app.storage.qc_store import QCReportStore
 from app.storage.transformed_store import TransformedArtifactStore
 from app.utils.hashing import sha256_of_path
@@ -266,7 +267,7 @@ class QCService:
                 report_uri=report_uri,
                 created_at=datetime.now(timezone.utc),
             )
-            (staging_dir / "manifest.json").write_text(manifest_model.model_dump_json(indent=2), encoding="utf-8")
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._qc_store.commit(transformation_id=transformation_id, qc_id=qc_id, staging_dir=staging_dir)
         except Exception:

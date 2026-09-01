@@ -25,6 +25,7 @@ Step 7  Transformation / Feature Generation  COMPLETE
 Step 8  Dataset QC                 COMPLETE
 Step 9  Dataset Packaging          COMPLETE
 Step 10 Versioning + Lineage       COMPLETE
+v2.1    Crash Safety + Atomic Artifacts (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -2834,6 +2835,183 @@ it never reaches a filesystem call at all.
 
 ---
 
+## Crash consistency and atomic artifacts (v2.1)
+
+Not a new pipeline stage — a cross-cutting reliability upgrade applied to
+every stage's storage layer. The question it answers: **what happens if
+the process dies while writing an artifact** (SIGKILL, power loss, OOM,
+an uncaught exception, a filesystem error, termination immediately
+before or after the atomic rename)? The invariant this section
+describes and tests: **no partially written artifact may ever appear at
+a finalized storage location.**
+
+### What v1.0 already had, and what was missing
+
+Before v2.1, 6 of the 9 write-producing stores (normalization,
+synchronization, cleaning, transformation, QC, packaging) already staged
+their output into a hidden `.tmp-<id>` directory next to its eventual
+final location and published it with one atomic `Path.rename()` — every
+service wrapping that write phase in `try/except Exception:
+store.discard(staging_dir)` and writing `manifest.json` **last**, right
+before committing. Packaging's multi-file package directory (`train/
+validation/test/split_index/manifest/report[/optional parquet]`) was
+therefore already published as a single atomic unit — a reader could
+never see `train.jsonl` without `test.jsonl`.
+
+The gap was the other 3 stores: ingestion (`app/storage/local.py`),
+validation reports, and integrity reports each created their *final*
+directory first (`mkdir(exist_ok=False)`) and wrote into it directly —
+so a crash mid-write left a partial, permanently-visible directory at
+the final location. v2.1 closes this gap and, at the same time,
+consolidates all 9 stores onto one shared primitive
+(`app.storage.atomic`) instead of leaving the fsync/durability/fault-
+injection work duplicated six times.
+
+### Staging model
+
+Two on-disk staging conventions coexist deliberately — both routed
+through the same commit primitive, both equally invisible to discovery:
+
+- **`.staging/<operation_id>/`** — a dedicated staging subtree, used by
+  ingestion, validation, and integrity (stores that had no prior staging
+  convention to preserve).
+- **`.tmp-<artifact_id>/`** — sibling-of-final staging, used by the six
+  stores that already had it. Kept as-is rather than migrated to the
+  convention above: dozens of existing tests assert this exact directory
+  name (`staging.name == ".tmp-norm_a"`), and renaming a working,
+  already-invisible convention for six stores would have been pure
+  churn with no safety benefit.
+
+Both conventions are invisible to every `find_manifest`/`find_reports`
+lookup and to the catalog scanner for the same two independent reasons:
+`Path.glob()` skips dot-prefixed path components by default (so neither
+`.staging` nor `.tmp-*` ever matches a `*` wildcard in a lookup glob),
+and the scanner's `_is_staging_path()` guard checks for both prefixes
+explicitly as defense-in-depth. `tests/test_staging_invisibility.py`
+proves this directly — including a staging directory containing a
+completely valid-looking, well-formed manifest, which is still never
+returned by any lookup or indexed by a scan.
+
+### Atomic publish lifecycle
+
+Every store's commit path goes through exactly two functions in
+`app/storage/atomic.py`:
+
+```
+writer creates staging_dir via create_staging_dir(...)
+    -> writes ordinary files into staging_dir with ordinary file I/O
+    -> (optional) write_manifest_file(...) for the manifest/report, last
+    -> commit_staging_dir(staging_dir, final_dir)
+         1. reject if final_dir already exists (no silent overwrite)
+         2. ensure final_dir's parent chain exists
+         3. optional verify(staging_dir) callback — raise to abort
+         4. fsync every staged data file, then the manifest/report file
+         5. remove the staging_state.json run-state journal
+         6. fsync the staging directory itself
+         7. Path.rename(staging_dir, final_dir)  <- the atomic step
+         8. best-effort fsync of final_dir's parent
+```
+
+If anything raises before step 7, `final_dir` never exists. If step 7
+succeeds, `final_dir` is exactly what was staged — there is no
+in-between state a reader can observe.
+
+### Durability guarantee — be precise about what is and isn't promised
+
+- **Atomic visibility is mandatory**: `Path.rename()` on the same
+  filesystem is atomic, so a reader only ever sees an artifact directory
+  in its pre-existing state or its fully-committed state.
+- **Full power-loss durability is best-effort**: this module fsyncs
+  written files, the staging directory, and the destination's parent
+  directory, but true durability also depends on the underlying
+  filesystem and storage hardware actually honoring fsync — something
+  this module cannot verify. Directory fsync is skipped, not fatal, on
+  platforms that don't support it. `FSYNC_ENABLED=false` keeps atomic
+  visibility but drops even the best-effort durability work (test-speed
+  escape hatch only).
+
+### Finalized artifact vs. run state
+
+A finalized artifact's manifest only ever declares `completed` or
+`rejected` (or each stage's equivalent terminal status) — never
+`running`. In-progress run state lives entirely in a separate
+`staging_state.json` journal inside the staging directory
+(`operation_id`, `artifact_id`, `stage`, `started_at`, `pid`, `state` —
+`writing` / `verifying` / `committing`, `final_destination`), and that
+journal is deleted before the final rename, so it never becomes part of
+a finalized artifact. A crash landing in the narrow window between that
+deletion and the rename is classified `INVALID_STAGING_ENTRY` by the
+recovery scanner rather than `STALE` — the safety invariant is
+unaffected either way, since the directory is still under `.staging`/
+`.tmp-` and invisible to every lookup.
+
+### Stale staging detection and recovery
+
+`app.storage.recovery.RecoveryService` scans every configured storage
+root's `.staging/`/`.tmp-*` entries and classifies each one:
+
+| Classification | Meaning |
+|---|---|
+| `ACTIVE` | `started_at` is within `STALE_STAGING_AFTER_SECONDS` — likely a real in-flight write |
+| `STALE` | older than the threshold — almost certainly abandoned by a crashed process |
+| `INVALID_STAGING_ENTRY` | `staging_state.json` is missing or unparseable — reported, never guessed at |
+
+Liveness is **never** inferred from a bare PID (PIDs are reused, and
+this scanner has no reliable, portable way to check whether a given PID
+still refers to the same process) — classification is purely
+time-based, which is conservative and fully portable. `scan()` is
+read-only; `cleanup_stale()` only ever removes `STALE` entries — never
+`ACTIVE`, and never `INVALID_STAGING_ENTRY`, since a directory this
+module can't confidently date is reported for a human to look at, not
+guessed at. Minimal endpoints: `GET /api/v1/recovery/scan`,
+`POST /api/v1/recovery/cleanup?dry_run=`.
+
+v2.1 does **not** implement record-level resume. Be precise about the
+guarantee: **a failed or interrupted stage is safely rerunnable from the
+beginning** — it is not true that a failed stage resumes from the exact
+record where it stopped.
+
+### Idempotency infrastructure (not wired into any live service)
+
+`app.storage.idempotency.execution_key()` computes a deterministic
+SHA-256 over `(stage, upstream_identity, upstream_content_sha256,
+config_hash, implementation_version)` — never over a randomly generated
+artifact ID, so two equivalent requests produce the same key. This is
+infrastructure only: no v2.1 service calls it to deduplicate a request.
+Wiring it in would change v1.0's existing, tested behavior (today, two
+identical requests intentionally produce two distinct artifacts), so
+that decision is left to a future, explicit opt-in per stage rather than
+forced here.
+
+### Catalog rebuild crash behavior
+
+The catalog was not restructured for v2.1 — and deliberately so.
+`CatalogService.rebuild()` already runs `clear_artifact_index()` +
+`CatalogScanner.scan(strict=True)` inside one real SQLite transaction
+(`CatalogRepository.transaction()`, manual `BEGIN`/`COMMIT`/`ROLLBACK`).
+SQLite's own rollback-journal recovery already guarantees that a process
+killed mid-transaction leaves the on-disk `catalog.db` in its
+**pre-rebuild** state the moment any connection reopens it — no bespoke
+crash-safety code is needed here, and introducing a temporary-database-
+plus-swap strategy on top of that would add risk without adding safety.
+`tests/test_crash_safety_subprocess.py` proves this with a real SIGKILL:
+a child process is killed mid-transaction, and a fresh connection
+afterward sees exactly the pre-kill artifact count.
+
+### Fault injection
+
+`app.storage.atomic.fault_injector` exposes named checkpoints
+(`AFTER_STAGING_CREATED`, `AFTER_MANIFEST_WRITE`, `AFTER_DATA_FSYNC`,
+`AFTER_MANIFEST_FSYNC`, `BEFORE_RENAME`, `AFTER_RENAME`,
+`BEFORE_PARENT_FSYNC`) that are no-ops in production and raise
+test-installed exceptions in `tests/test_atomic_commit.py` and
+`tests/test_crash_safety_fault_injection.py`. Two real subprocess-kill
+tests (`tests/test_crash_safety_subprocess.py`) additionally prove the
+same guarantees against an actual `SIGKILL`, not just a simulated
+Python exception, for both a filesystem store and the SQLite catalog.
+
+---
+
 ## Setup
 
 ```bash
@@ -2930,6 +3108,9 @@ Environment variables (all optional, sensible defaults provided):
 | `MAX_QC_VALUES_PER_FEATURE` | `100000`             | Cap on raw scalar values retained per feature for exact percentiles |
 | `PACKAGE_STORAGE_ROOT`      | `data/packages`      | Root directory for persisted dataset package artifacts |
 | `CATALOG_DB_PATH`           | `data/catalog/catalog.db` | SQLite metadata catalog — an index over the manifests above, never their source of truth |
+| `STAGING_DIR_NAME`          | `.staging`           | Staging subtree name for ingestion/validation/integrity (v2.1) |
+| `STALE_STAGING_AFTER_SECONDS` | `3600.0`           | Age threshold before the recovery scanner classifies a staging entry STALE |
+| `FSYNC_ENABLED`             | `true`               | fsync staged files/directories before/after atomic rename (v2.1); disabling keeps atomic visibility but drops best-effort durability |
 
 ## How raw storage works
 
@@ -2985,6 +3166,19 @@ end-to-end. Step 9's optional Parquet tests are skipped cleanly
 `test_catalog_lineage.py` independently verifies that scanning,
 rebuilding, and recursive verification never modify a single byte across
 any of the 9 upstream storage roots.
+
+v2.1 adds 49 more tests (927 total) across `test_atomic_commit.py`,
+`test_staging_invisibility.py`, `test_recovery_service.py`,
+`test_crash_safety_fault_injection.py`,
+`test_crash_safety_subprocess.py`, and `test_idempotency.py`, plus a
+shared `crash_safety_helpers.py` of reusable invariant assertions
+(`assert_no_partial_final_artifacts`, `assert_staging_not_discoverable`,
+`assert_upstream_unchanged`, `assert_final_artifact_checksums_valid`)
+used across several of those files.
+`test_crash_safety_subprocess.py`'s two tests use real `SIGKILL` via
+`multiprocessing`, synchronized deterministically with
+`multiprocessing.Event` (never sleep-based polling) so they aren't
+flaky.
 
 ## Deliberate MVP limitations
 
@@ -3275,7 +3469,36 @@ any of the 9 upstream storage roots.
   ability to fully reconstruct the artifact/edge tables from nothing but
   the 9 storage roots.
 
+**v2.1:**
+- No record-level resume — a failed or interrupted stage is safely
+  rerunnable from the beginning, never resumed from the exact record
+  where it stopped. This is a deliberate scope boundary, not an
+  oversight.
+- No PID-based liveness checking — stale-staging classification is
+  purely time-based (`STALE_STAGING_AFTER_SECONDS`), since PIDs can be
+  reused and there is no portable, reliable way to check whether a given
+  PID still refers to the same process.
+- No automatic recovery — `cleanup_stale()` must be called explicitly
+  (or via `POST /api/v1/recovery/cleanup`); nothing runs it on a
+  schedule or at startup in this milestone.
+- Idempotency is infrastructure only (`app.storage.idempotency.
+  execution_key`) — not wired into any live service, so two identical
+  requests still intentionally produce two distinct artifacts, exactly
+  as in v1.0.
+- The catalog itself was not restructured — its existing SQLite
+  transaction already provides crash safety for rebuild (see "Catalog
+  rebuild crash behavior" above); this milestone did not introduce
+  concurrent-writer coordination, WAL mode, or a temp-database-swap
+  strategy.
+- No cloud storage, distributed workers, authentication, multi-tenancy,
+  a web dashboard, full pipeline orchestration, a CLI, or multiprocessing
+  concurrency — all out of scope for this milestone, consistent with
+  every prior step's local-first, single-process design.
+
 ## Status
 
-All 10 planned steps are complete and fully tested (878 tests). No
-Step 11 work has been started or planned as part of this build.
+All 10 planned steps are complete and fully tested. v2.1 (Crash Safety &
+Atomic Artifacts) adds crash-safe, atomically-published artifacts and a
+staging recovery service across every stage's storage layer — 927 tests
+total. No Step 11 work has been started or planned as part of this
+build.

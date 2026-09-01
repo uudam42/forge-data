@@ -30,6 +30,7 @@ from typing import BinaryIO, Iterator
 
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.storage.atomic import write_manifest_file
 from app.storage.base import RawStorage
 from app.storage.normalized_store import NormalizedArtifactStore
 from app.storage.synchronization_store import SynchronizationArtifactStore
@@ -267,9 +268,7 @@ class SynchronizationService:
                 artifact_uri=f"file://{self._artifact_store.artifact_path(synchronization_id=synchronization_id, filename=_ARTIFACT_FILENAME)}",
                 artifact_filename=_ARTIFACT_FILENAME,
             )
-            (staging_dir / "manifest.json").write_text(
-                manifest_model.model_dump_json(indent=2), encoding="utf-8"
-            )
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._artifact_store.commit(synchronization_id=synchronization_id, staging_dir=staging_dir)
         except Exception:

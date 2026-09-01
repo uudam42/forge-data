@@ -62,6 +62,7 @@ from app.packaging.registry import PackagingProfileRegistry
 from app.packaging.serialization import canonical_json, compute_file_sha256
 from app.packaging.splitter import UnsupportedSplitStrategyError, assign_splits
 from app.qc.models import QCStatus
+from app.storage.atomic import write_manifest_file
 from app.storage.package_store import DatasetPackageStore
 from app.storage.qc_store import QCReportStore
 from app.storage.transformed_store import TransformedArtifactStore
@@ -270,7 +271,7 @@ class PackagingService:
                 description=request.description,
                 rejection_reasons=result.rejection_reasons,
             )
-            (staging_dir / "manifest.json").write_text(manifest_model.model_dump_json(indent=2), encoding="utf-8")
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._package_store.commit(transformation_id=transformation_id, package_id=package_id, staging_dir=staging_dir)
         except Exception:

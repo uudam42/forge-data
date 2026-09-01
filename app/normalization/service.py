@@ -40,6 +40,7 @@ from app.normalization.profiles.base import (
     UnsupportedSourceUnitError,
 )
 from app.normalization.registry import NormalizationProfileNotFoundError, NormalizationProfileRegistry
+from app.storage.atomic import write_manifest_file
 from app.storage.base import RawStorage
 from app.storage.integrity_store import IntegrityReportStore
 from app.storage.normalized_store import NormalizedArtifactStore
@@ -359,9 +360,7 @@ class NormalizationService:
                 created_at=datetime.now(timezone.utc),
                 artifact_uri=artifact_uri,
             )
-            (staging_dir / "manifest.json").write_text(
-                manifest_model.model_dump_json(indent=2), encoding="utf-8"
-            )
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._artifact_store.commit(
                 ingestion_id=ingestion_id, normalization_id=normalization_id, staging_dir=staging_dir

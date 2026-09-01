@@ -91,6 +91,22 @@ class Settings(BaseSettings):
     # a rebuild must fully restore catalog state from the filesystem.
     CATALOG_DB_PATH: Path = Path("data/catalog/catalog.db")
 
+    # Crash safety / atomic artifact commit (v2.1). See
+    # docs/DETAILED_GUIDE.md#crash-consistency-and-atomic-artifacts.
+    STAGING_DIR_NAME: str = ".staging"
+
+    # A staging entry with no observed activity older than this is
+    # classified STALE by the recovery scanner rather than ACTIVE.
+    # Conservative default: long enough that a real in-flight request
+    # (even a large upload) is never mistaken for an abandoned one.
+    STALE_STAGING_AFTER_SECONDS: float = 3600.0
+
+    # fsync staged files, the staging directory, and the destination's
+    # parent directory before/after atomic rename. Disabling this keeps
+    # atomic visibility (the rename itself is still atomic) but drops the
+    # best-effort durability guarantee -- useful only for test speed.
+    FSYNC_ENABLED: bool = True
+
     APP_NAME: str = "ai-data-pipeline"
     LOG_LEVEL: str = "INFO"
 

@@ -40,6 +40,7 @@ from app.cleaning.registry import CleaningPolicyRegistry
 from app.cleaning.rules.common import canonical_json, is_valid_field_path
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.storage.atomic import write_manifest_file
 from app.storage.cleaned_store import CleanedArtifactStore
 from app.storage.synchronization_store import SynchronizationArtifactStore
 from app.utils.filenames import extension_of
@@ -216,9 +217,7 @@ class CleaningService:
                 created_at=datetime.now(timezone.utc),
                 rejection_reasons=rejection_reasons,
             )
-            (staging_dir / "manifest.json").write_text(
-                manifest_model.model_dump_json(indent=2), encoding="utf-8"
-            )
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._cleaned_store.commit(
                 synchronization_id=synchronization_id, cleaning_id=cleaning_id, staging_dir=staging_dir

@@ -51,7 +51,18 @@ class ScanOutcome:
 
 
 def _is_staging_path(path: Path) -> bool:
-    return any(part.startswith(".tmp-") or part == ".gitkeep" for part in path.parts)
+    """True for anything under a staging convention this codebase uses:
+    the sibling-of-final `.tmp-<id>` directories (normalization,
+    synchronization, cleaning, transformation, qc, package) and the
+    dedicated `.staging/` subtree (ingestion, validation, integrity) — see
+    app.storage.atomic. Both are already excluded by every glob() call
+    below since Path.glob() skips dot-prefixed components by default; this
+    check is defense-in-depth, not the only thing preventing a staging
+    entry from being scanned.
+    """
+    return any(
+        part.startswith(".tmp-") or part == ".gitkeep" or part == ".staging" for part in path.parts
+    )
 
 
 def _load_json(path: Path) -> dict:

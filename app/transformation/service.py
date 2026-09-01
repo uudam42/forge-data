@@ -22,6 +22,7 @@ from pathlib import Path
 from app.cleaning.models import CleaningStatus, PolicyRef
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.storage.atomic import write_manifest_file
 from app.storage.cleaned_store import CleanedArtifactStore
 from app.storage.transformed_store import TransformedArtifactStore
 from app.synchronization.readers import InvalidTimestampError, format_epoch_us, parse_canonical_timestamp_us
@@ -249,9 +250,7 @@ class TransformationService:
                 report_uri=report_uri,
                 created_at=datetime.now(timezone.utc),
             )
-            (staging_dir / "manifest.json").write_text(
-                manifest_model.model_dump_json(indent=2), encoding="utf-8"
-            )
+            write_manifest_file(staging_dir, "manifest.json", manifest_model.model_dump_json(indent=2))
 
             self._transformed_store.commit(
                 cleaning_id=cleaning_id, transformation_id=transformation_id, staging_dir=staging_dir
