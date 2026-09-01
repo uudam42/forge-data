@@ -228,12 +228,19 @@ robotics_demo @ 1.0.0
 
 ## Testing
 
-927 tests currently cover per-stage behavior, lineage gates, determinism, artifact
+940 tests currently cover per-stage behavior, lineage gates, determinism, artifact
 immutability, checksum validation, API contracts, crash-safety/atomic-commit
 guarantees (including real subprocess kill tests), and full end-to-end pipeline runs.
 
 ```bash
 pytest
+```
+
+An additional opt-in `tests/load/` suite (11 tests, deselected by default) exercises real
+memory measurement at up to 1,000,000-row scale:
+
+```bash
+pytest -m load
 ```
 
 ## Project structure
@@ -246,7 +253,7 @@ app/
   catalog/            Lineage graph, verification, dataset registry, SQLite catalog
   storage/            Immutable artifact stores (one per stage) + catalog store
   api/routes/         FastAPI routers, one per stage
-tests/                927 tests
+tests/                940 tests (+ opt-in tests/load/, 11 tests, `pytest -m load`)
 schemas/              Built-in IMU / GPS schema definitions
 docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
 ```
@@ -264,12 +271,23 @@ The v1.0 core pipeline is complete and validated end-to-end, with:
 - global lineage
 - a dataset version registry
 
+v2 development:
+- v2.1 Crash Safety & Atomic Artifacts — COMPLETE
+- v2.2 Large-scale Streaming & Resource Bounds — COMPLETE
+
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
 process can never leave a partial artifact where a finalized one is expected. Details:
 [Full Technical Guide § Crash consistency and atomic artifacts](docs/DETAILED_GUIDE.md#crash-consistency-and-atomic-artifacts-v21).
 
-The current implementation is **local-first and single-node**. Cloud storage, orchestration,
+**v2.2 (Large-scale Streaming & Resource Bounds)** documents a resource contract for every
+stage, adds a scalable SQLite-backed exact-dedup option for cleaning (the default in-memory
+backend's O(unique_rows) growth is now measured and documented, not just claimed), and adds
+disk-space preflight checks before large writes. Details:
+[Full Technical Guide § Large-data execution and resource model](docs/DETAILED_GUIDE.md#large-data-execution-and-resource-model-v22).
+
+The current implementation is **local-first and single-node** — designed for large
+single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,
 authentication, multi-tenancy, and a web dashboard are planned for the next phase — see
 [Roadmap](#roadmap).
 

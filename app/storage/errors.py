@@ -19,6 +19,7 @@ class StorageErrorCode(str, Enum):
     STAGING_METADATA_INVALID = "STAGING_METADATA_INVALID"
     STALE_STAGING_FOUND = "STALE_STAGING_FOUND"
     ARTIFACT_NOT_FINALIZED = "ARTIFACT_NOT_FINALIZED"
+    INSUFFICIENT_DISK_SPACE = "INSUFFICIENT_DISK_SPACE"
 
 
 class StorageLayerError(Exception):
@@ -56,3 +57,29 @@ class StaleStagingFoundError(StorageLayerError):
 
 class ArtifactNotFinalizedError(StorageLayerError):
     code = StorageErrorCode.ARTIFACT_NOT_FINALIZED
+
+
+class InsufficientDiskSpaceError(StorageLayerError):
+    code = StorageErrorCode.INSUFFICIENT_DISK_SPACE
+
+    def __init__(
+        self, *, stage: str, available_bytes: int, estimated_required_bytes: int, reserve_bytes: int
+    ) -> None:
+        self.stage = stage
+        self.available_bytes = available_bytes
+        self.estimated_required_bytes = estimated_required_bytes
+        self.reserve_bytes = reserve_bytes
+        super().__init__(
+            f"Insufficient disk space for stage={stage!r}: available={available_bytes} bytes, "
+            f"estimated required (with safety margin)={estimated_required_bytes} bytes, "
+            f"reserve={reserve_bytes} bytes"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code.value,
+            "stage": self.stage,
+            "available_bytes": self.available_bytes,
+            "estimated_required_bytes": self.estimated_required_bytes,
+            "reserve_bytes": self.reserve_bytes,
+        }

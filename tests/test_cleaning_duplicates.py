@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from app.cleaning.rules.base import RuleContext
-from app.cleaning.rules.duplicates import DuplicateRowRule, canonical_row_key
+from app.cleaning.rules.duplicates import DedupIndexCreateFailedError, DuplicateRowRule, canonical_row_key
 
 
 def _row(timestamp: str, **streams) -> dict:
@@ -109,3 +113,68 @@ def test_duplicate_detection_stable_across_runs() -> None:
         ]
 
     assert run() == run() == [False, False, True]
+
+
+# ---------------------------------------------------------------------------
+# v2.2: sqlite-backed dedup index -- same exact semantics, disk instead of
+# process memory.
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_backend_requires_temp_dir() -> None:
+    with pytest.raises(ValueError):
+        DuplicateRowRule(backend="sqlite")
+
+
+def test_unknown_backend_rejected() -> None:
+    with pytest.raises(ValueError):
+        DuplicateRowRule(backend="bloom_filter")
+
+
+def test_sqlite_backend_matches_memory_backend_exactly(tmp_path: Path) -> None:
+    rows = [
+        _row("2026-08-30T18:00:00Z", imu={"accel_x": 0.1}),
+        _row("2026-08-30T18:00:01Z", imu={"accel_x": 0.2}),
+        _row("2026-08-30T18:00:00Z", imu={"accel_x": 0.1}),  # duplicate of row 1
+        _row("2026-08-30T18:00:02Z", imu={"accel_x": 0.3}),
+        _row("2026-08-30T18:00:01Z", imu={"accel_x": 0.2}),  # duplicate of row 2
+    ]
+
+    def run(rule: DuplicateRowRule) -> list[tuple[bool, int | None]]:
+        results = []
+        for i, row in enumerate(rows, start=1):
+            outcome = rule.evaluate(row, context=RuleContext(row_index=i))
+            dup_of = outcome.drop_reasons[0].duplicate_of_row_index if outcome.should_drop else None
+            results.append((outcome.should_drop, dup_of))
+        return results
+
+    memory_rule = DuplicateRowRule(backend="memory")
+    sqlite_rule = DuplicateRowRule(backend="sqlite", temp_dir=tmp_path)
+    try:
+        assert run(memory_rule) == run(sqlite_rule) == [
+            (False, None), (False, None), (True, 1), (False, None), (True, 2),
+        ]
+    finally:
+        memory_rule.close()
+        sqlite_rule.close()
+
+
+def test_sqlite_backend_removes_its_temp_file_on_close(tmp_path: Path) -> None:
+    rule = DuplicateRowRule(backend="sqlite", temp_dir=tmp_path)
+    rule.evaluate(_row("2026-08-30T18:00:00Z", imu={"accel_x": 0.1}), context=RuleContext(row_index=1))
+
+    db_files_during = list(tmp_path.glob(".dedup_index.sqlite3*"))
+    assert db_files_during, "expected a temp dedup db file while the rule is active"
+
+    rule.close()
+    db_files_after = list(tmp_path.glob(".dedup_index.sqlite3*"))
+    assert db_files_after == []
+
+
+def test_sqlite_backend_create_failure_is_a_structured_error(tmp_path: Path) -> None:
+    # Point temp_dir at a path that can't hold a database file (a file, not
+    # a directory) to force sqlite3.connect() to fail.
+    not_a_dir = tmp_path / "not_a_directory"
+    not_a_dir.write_text("x", encoding="utf-8")
+    with pytest.raises(DedupIndexCreateFailedError):
+        DuplicateRowRule(backend="sqlite", temp_dir=not_a_dir / "nested")

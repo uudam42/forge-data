@@ -93,6 +93,33 @@ def test_valid_synchronized_dataset_cleans_successfully(client: TestClient) -> N
     assert body["summary"]["dropped_rows"] == 0
 
 
+def test_sqlite_dedup_backend_end_to_end_matches_memory_backend(client: TestClient, cleaned_root: Path) -> None:
+    """v2.2: the sqlite dedup backend produces byte-identical output to
+    the default memory backend, and leaves no temp index file behind in
+    the finalized artifact directory."""
+    sync = _synchronized(client, session_id="sess_clean_api_sqlite")
+    memory_response = client.post(
+        f"{CLEAN_URL}/{sync['synchronization_id']}",
+        json=_default_clean_request(duplicate_policy={"enabled": True, "backend": "memory"}),
+    )
+    assert memory_response.status_code == 200, memory_response.text
+
+    sync2 = _synchronized(client, session_id="sess_clean_api_sqlite2")
+    sqlite_response = client.post(
+        f"{CLEAN_URL}/{sync2['synchronization_id']}",
+        json=_default_clean_request(duplicate_policy={"enabled": True, "backend": "sqlite"}),
+    )
+    assert sqlite_response.status_code == 200, sqlite_response.text
+
+    memory_body, sqlite_body = memory_response.json(), sqlite_response.json()
+    assert memory_body["summary"] == sqlite_body["summary"]
+
+    final_dir = cleaned_root / sync2["synchronization_id"] / sqlite_body["cleaning_id"]
+    assert final_dir.exists()
+    assert list(final_dir.glob(".dedup_index.sqlite3*")) == []
+    assert sorted(p.name for p in final_dir.iterdir()) == ["cleaned.jsonl", "manifest.json", "report.json"]
+
+
 def test_jsonl_output_valid(client: TestClient) -> None:
     sync = _synchronized(client)
     body = client.post(f"{CLEAN_URL}/{sync['synchronization_id']}", json=_default_clean_request()).json()

@@ -25,6 +25,12 @@ parquet = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "load: large-data load/scale tests (deselected by default; run explicitly with `pytest -m load`)",
+]
+# Plain `pytest` skips load tests so normal development stays fast;
+# `pytest -m load` on the command line overrides this and runs only them.
+addopts = "-m 'not load'"
 
 [build-system]
 requires = ["setuptools>=68"]

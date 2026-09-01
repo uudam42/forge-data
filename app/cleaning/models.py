@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -67,6 +68,13 @@ class PolicyRef(BaseModel):
 
 class DuplicatePolicyConfig(BaseModel):
     enabled: bool = True
+    # "memory" (default, unchanged v1.0/v2.1 behavior): O(unique_rows)
+    # process-memory dict. "sqlite": same exact first-occurrence-retained
+    # semantics, backed by a temporary on-disk index instead — for
+    # datasets whose unique-row count would make the in-memory dict too
+    # large. See app.cleaning.rules.duplicates and
+    # docs/DETAILED_GUIDE.md#large-data-execution-and-resource-model.
+    backend: Literal["memory", "sqlite"] = "memory"
 
 
 class PrivacyConfig(BaseModel):

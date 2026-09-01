@@ -13,6 +13,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings, get_settings
+from app.main import app
+
 PKG_URL = "/api/v1/packaging"
 
 IMU_CSV = "timestamp,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z\n" + "".join(
@@ -456,3 +459,33 @@ def test_session_grouping_never_splits_same_session(client: TestClient) -> None:
     assert body["status"] == "rejected"
     report = json.loads(Path(body["report_uri"].replace("file://", "")).read_text())
     assert report["leakage_checks"]["cross_split_groups"] == 0
+
+
+def test_disk_preflight_rejects_impossible_request_before_writing(
+    client: TestClient, test_settings: Settings, package_root: Path
+) -> None:
+    """v2.2: an intentionally impossible disk-space requirement (an
+    astronomically large DISK_RESERVE_BYTES) must be rejected with 507
+    BEFORE any package files are written -- not partway through."""
+    ready = _qc_ready(client, "sess_pkg_disk_preflight")
+    request = _default_package_request(qc_id=ready["qc_id"])
+
+    impossible_settings = test_settings.model_copy(update={"DISK_RESERVE_BYTES": 10**18})
+    app.dependency_overrides[get_settings] = lambda: impossible_settings
+    try:
+        with TestClient(app) as strict_client:
+            response = strict_client.post(f"{PKG_URL}/{ready['transformation_id']}", json=request)
+    finally:
+        app.dependency_overrides[get_settings] = lambda: test_settings
+
+    assert response.status_code == 507, response.text
+    body = response.json()["detail"]
+    assert body["code"] == "INSUFFICIENT_DISK_SPACE"
+    assert body["stage"] == "packaging"
+    assert body["reserve_bytes"] == 10**18
+
+    # Nothing was written for this transformation_id -- rejected before
+    # any expensive work began, not partway through.
+    transformation_pkg_dir = package_root / ready["transformation_id"]
+    existing = [d for d in transformation_pkg_dir.iterdir() if d.is_dir()] if transformation_pkg_dir.exists() else []
+    assert existing == []

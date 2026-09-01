@@ -26,6 +26,7 @@ Step 8  Dataset QC                 COMPLETE
 Step 9  Dataset Packaging          COMPLETE
 Step 10 Versioning + Lineage       COMPLETE
 v2.1    Crash Safety + Atomic Artifacts (cross-cutting, not a stage) COMPLETE
+v2.2    Large-scale Streaming + Resource Bounds (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -3012,6 +3013,310 @@ Python exception, for both a filesystem store and the SQLite catalog.
 
 ---
 
+## Large-data execution and resource model (v2.2)
+
+Forge Data is **designed for large single-machine workloads** — long
+multimodal sensor sessions on one developer laptop or one server, not
+distributed cluster scale. This section documents, per stage, exactly
+what "large" means: how memory scales, how many passes a stage makes
+over its input, and — just as importantly — where a structure is
+honestly *not* bounded, with a documented reason rather than a false
+claim.
+
+### Resource complexity by stage
+
+| Stage | Memory model | Passes | Notes |
+|---|---|---|---|
+| Ingestion | O(chunk) — `STREAM_CHUNK_BYTES` (default 1 MiB) | 1 | Hashes while streaming; never buffers the full upload |
+| Validation (CSV/JSONL) | O(1) + O(max_issues) | 1 | `csv.DictReader`/line-by-line; issues capped by `MAX_VALIDATION_ERRORS` |
+| Validation (JSON array) | **O(dataset)** — documented limitation | 1 | `json.load()` requires the whole array; use CSV/JSONL for large files |
+| Integrity (CSV/JSONL) | O(1) + O(max_issues) | 1 | Same shape as validation; capped by `MAX_INTEGRITY_ISSUES` |
+| Integrity (JSON array) | **O(dataset)** — documented limitation | 1 | Same underlying reader as validation's JSON path |
+| Normalization (CSV/JSONL) | O(chunk) | 1 | Streamed read → transform → streamed write |
+| Normalization (JSON array output) | **O(dataset)** — documented limitation | 1 | A JSON array must be fully assembled before its closing `]`; CSV/JSONL output has no such constraint |
+| Synchronization (reference-stream mode) | O(streams + bounded cursor state) | 1 | `StreamCursor` holds only `prev`/`pending` per stream — see below |
+| Synchronization (fixed-rate mode) | O(streams + bounded cursor state) | 2 (documented) | Pass 1: streams each stream once for its (first, last) timestamp range only (no buffering). Pass 2: the real streaming alignment pass. The synthetic timeline itself is a lazy generator, never materialized |
+| Cleaning (structural rules) | O(1) per row | 1 | Required-streams/coverage/privacy-redaction rules hold no cross-row state |
+| Cleaning (duplicate detection, `backend=memory`, default) | **O(unique_rows)** — documented limitation | 1 | A `{content_hash: first_index}` dict; unchanged v1.0/v2.1 default |
+| Cleaning (duplicate detection, `backend=sqlite`, v2.2) | O(1) process memory | 1 | Same exact semantics, seen-set spilled to a temporary on-disk SQLite index instead |
+| Transformation (count windows) | O(window_size) | 1 | `collections.deque`, evicted as soon as no in-flight window needs a row |
+| Transformation (time windows) | O(rows within the widest currently-open window span) | 1 | Windows close (and their rows are yielded/freed) as soon as the stream passes their end time |
+| QC (count/mean/variance/min/max) | O(feature_count) | 1 | Welford's online algorithm — never stores raw values |
+| QC (percentiles) | O(feature_count × min(n, `MAX_QC_VALUES_PER_FEATURE`)) | 1 | Capped, first-encountered-order retention — see "QC percentile behavior" below |
+| Packaging (pass 1: grouping) | O(samples) — lightweight metadata only | 1 | `SampleRecord` holds 4 scalar fields per sample, never the feature payload |
+| Packaging (pass 2: writers) | O(writer buffers), JSONL exporter | 1 | Streamed per-sample writes to split files |
+| Packaging (Parquet exporter, optional) | **O(split size)** — documented limitation | 1 | pyarrow's table-building API accumulates full columns before writing; only reached when `exports` includes `"parquet"` |
+| Catalog | O(metadata records), not raw dataset rows | — | SQLite indexes manifests/checksums only, never sensor payloads |
+
+This table was produced by reading the actual implementation of every
+row listed (`app/*/service.py`, `app/*/records.py`,
+`app/synchronization/{timeline,readers,strategies,clocks}.py`,
+`app/transformation/windowing.py`, `app/qc/accumulator.py`,
+`app/packaging/grouping.py`, `app/packaging/exporters/*.py`) — not
+assumed from prior documentation. Most of this codebase was already
+disciplined about streaming before v2.2; the genuinely new work was the
+sqlite dedup backend and the disk-preflight infrastructure below.
+
+### Streaming guarantees
+
+- Every reader that can be a generator is one: `iter_records`,
+  `iter_typed_records`, `apply_stream_correction`, `fixed_rate_timeline`,
+  `iter_count_windows`, `iter_time_windows` all `yield` rather than
+  return a list.
+- `StreamCursor` (`app/synchronization/strategies/base.py`) is the
+  concrete mechanism behind synchronization's bounded memory: it holds
+  exactly `prev` and `pending` per stream — never the whole stream —
+  because alignment targets are always visited in non-decreasing order.
+- Count-window transformation uses a `deque`, popped the moment a row
+  can no longer belong to any in-flight window (`app/transformation/
+  windowing.py`). Time-window transformation closes (and frees) a window
+  as soon as the stream passes its end time.
+- None of the above required a code change for v2.2 — they were already
+  correct. What changed is that this is now measured and documented
+  (`tests/load/`), not merely asserted.
+
+### Known non-bounded structures (documented, not hidden)
+
+Three structures are genuinely O(dataset), by design trade-off, not
+oversight:
+
+1. **JSON array input/output** (validation, integrity, normalization) —
+   a top-level JSON array requires the whole array in memory to parse or
+   to close with `]`. CSV and JSONL remain fully streaming for every
+   stage. Adding a streaming JSON parser (e.g. `ijson`) was considered
+   and rejected for v2.2: it's a new dependency for a format this
+   project's primary robotics data paths (CSV/JSONL) don't need.
+2. **The in-memory cleaning dedup backend** (`duplicate_policy.backend
+   = "memory"`, the default) — O(unique_rows). This is exactly why the
+   `sqlite` backend exists (see below) as an explicit, opt-in
+   alternative with identical semantics.
+3. **The optional Parquet exporter** — accumulates full columns before
+   writing a row group. Parquet export is optional
+   (`pip install .[parquet]`, only reached when a request's `exports`
+   includes `"parquet"`); JSONL, the mandatory export, is fully
+   streamed.
+
+### Dedup backend behavior
+
+```
+duplicate_policy:
+  enabled: true
+  backend: memory | sqlite   # default: memory (unchanged v1.0/v2.1 behavior)
+```
+
+Both backends give **byte-identical, first-occurrence-retained exact
+matches** — never an approximation (no Bloom filter: a false positive
+would silently change which rows get dropped, which this project will
+never accept for an exact-dedup guarantee). `backend="sqlite"` puts the
+seen-set in a temporary on-disk index
+(`app/cleaning/rules/duplicates.py::_SqliteSeenIndex`) inside the
+cleaning run's own v2.1 staging directory instead of a process-memory
+dict:
+
+- Removed via `close()` (called in a `finally` around row processing,
+  before `commit()`) on success, and via `discard_staging_dir()` on any
+  failure — either way, it never becomes part of a finalized artifact
+  and is never visible to catalog scans or artifact discovery.
+- `tests/load/test_load_cleaning_dedup.py` measured both backends at
+  50,000 and 1,000,000 unique rows on this project's reference machine:
+  the memory backend grew from 40.5 MB to 227.4 MB (confirming the
+  documented O(unique_rows) limitation is real); the sqlite backend
+  stayed at 33.3 MB → 33.5 MB.
+- No automatic memory→disk spillover threshold was implemented — an
+  explicit per-request `backend` choice is simpler, has no surprising
+  behavior change mid-run, and was judged sufficient for v2.2's stated
+  goal ("Introduce a scalable exact-dedup backend without changing
+  default semantic correctness" — not "auto-detect scale").
+
+### QC percentile behavior
+
+`WelfordAccumulator` (count/mean/variance/min/max) is **exact for any
+dataset size** — a single-pass, numerically stable online algorithm
+that never stores a raw value. `PercentileBuffer` is different and this
+must be stated precisely: it retains up to `MAX_QC_VALUES_PER_FEATURE`
+raw values **in first-encountered order** (never a random or reservoir
+sample) and computes percentiles from that retained subset.
+
+- Below the cap: percentiles are **exact**.
+- Above the cap: percentiles are computed from a **first-N-values
+  sample, not a statistically representative one** — if the underlying
+  metric trends over time (e.g. a sensor's baseline drifting across a
+  long session), a first-N sample is systematically biased toward the
+  early part of the run. This was true before v2.2 and is now stated
+  explicitly rather than left implicit.
+- The report always exposes `percentiles_truncated: bool` — a caller
+  can and should check it before treating a large dataset's percentiles
+  as authoritative.
+- No bounded-memory quantile sketch (e.g. t-digest, GK) was introduced
+  for v2.2: the existing capped-buffer approach, once accurately
+  labeled, was judged sufficient — this project would rather ship an
+  honestly-labeled approximation than add complexity for a marginal
+  accuracy gain nothing in this milestone's scope required.
+
+### Disk preflight
+
+`app/storage/disk_preflight.py` — `require_disk_space(path, stage=,
+estimated_required_bytes=, reserve_bytes=, safety_factor=)` checks free
+space on the target filesystem *before* a stage starts an expensive
+write, raising `InsufficientDiskSpaceError` (mapped to HTTP `507`) with
+structured `{code, stage, available_bytes, estimated_required_bytes,
+reserve_bytes}` detail if space looks obviously insufficient.
+
+- **Estimates, not measurements**: `estimate_required_bytes(input_bytes,
+  ratio=)` multiplies input size by a documented, stage-chosen ratio
+  (e.g. packaging uses 1.5× the transformed input, accounting for
+  train/validation/test/split_index/report/manifest). This is a
+  heuristic; free space can also change between the check and the
+  actual write from unrelated activity on the same disk.
+- **Wired in for v2.2**: ingestion (against `MAX_UPLOAD_SIZE_MB` as the
+  worst case, since actual upload size isn't known upfront for a
+  streamed multipart body) and packaging (against the transformed
+  input's actual on-disk size). Normalization, synchronization,
+  cleaning, transformation, and QC do **not** yet call this — they
+  remain a documented gap, not silently assumed safe; the same
+  `require_disk_space()` helper is ready for them to adopt.
+- **Conservative defaults** (`DISK_RESERVE_BYTES=100 MiB`,
+  `DISK_SAFETY_FACTOR=1.2`, `MIN_FREE_DISK_BYTES=50 MiB`) are
+  deliberately small so a normal developer laptop or CI runner never
+  trips them on a tiny test fixture — `tests/test_disk_preflight.py`
+  and `tests/test_packaging_api.py::
+  test_disk_preflight_rejects_impossible_request_before_writing` prove
+  both the pass and the (intentionally astronomical, test-only) reject
+  path.
+
+### Temporary storage
+
+Every piece of v2.2 temporary state lives inside a v2.1-recognized
+staging location, never in `/tmp` or another untracked path:
+
+- The sqlite dedup index lives inside the cleaning run's own staging
+  directory (`.staging/<cleaning_id>/.dedup_index.sqlite3` in spirit —
+  concretely wherever that store's existing `.tmp-<id>` staging
+  directory is) and is removed before that directory is ever renamed
+  into its final location.
+- This means it is automatically covered by every v2.1 guarantee for
+  free: invisible to catalog scans and artifact discovery, cleaned up by
+  `discard_staging_dir()` on any failure, and never present in a
+  finalized artifact — verified explicitly by
+  `tests/load/test_load_crash_safety.py`, which injects a crash during a
+  50,000-row cleaning run using the sqlite backend and confirms no
+  leaked `.dedup_index.sqlite3*` file anywhere under the cleaned root.
+
+### Load test methodology
+
+`tests/load/` — deselected by default (`pytest -m "not load"` is the
+project's default via `pyproject.toml`'s `addopts`); run explicitly with
+`pytest -m load`. Peak memory is measured by
+`tests/load/memory_utils.measure_peak_rss()`, which runs the workload
+under test in a **fresh subprocess** (`multiprocessing`, "spawn" start
+method) and reads that subprocess's own
+`resource.getrusage(RUSAGE_SELF).ru_maxrss` after it exits — deliberate,
+not incidental: `ru_maxrss` is a running historical maximum for a
+process's entire lifetime, so measuring it inside the long-lived pytest
+process itself would be contaminated by every previous test. A fresh
+subprocess starts that counter at (near) zero.
+
+Covered today: ingestion (byte-size scaling), CSV validation (1M rows,
+bounded-issue accumulation, 100k/500k/1M growth comparison), the
+cleaning dedup backends (50k vs. 1M unique rows), count-window
+transformation (1M rows, all three stride/size relationships, and
+window-size scaling), and one combined large-scale-plus-crash-injection
+test. Synchronization, QC, and packaging are exercised at 100k/500k/1M
+scale via the benchmark script (below) rather than as permanent
+`load`-marked pytest files — their bounded-memory behavior was verified
+by code audit (the table above) and by v1.0/v2.1's existing determinism
+test suites; adding dedicated multi-hundred-line load-test files for
+already-audited, already-bounded stages was judged lower value than the
+stages that either changed in v2.2 (cleaning dedup) or are the most
+data-size-sensitive by construction (validation, ingestion,
+transformation).
+
+### Benchmark instructions
+
+```bash
+python scripts/benchmark_large_pipeline.py                          # 100k / 500k / 1M rows
+python scripts/benchmark_large_pipeline.py --sizes 10000             # a quick smoke run
+python scripts/benchmark_large_pipeline.py --sizes 1000000 --keep-data
+```
+
+Generates synthetic IMU (+ 1/10th-rate GPS) CSVs, runs the full
+ingestion → packaging pipeline via FastAPI's `TestClient`, and reports
+per-stage duration/throughput/bytes plus one whole-run peak RSS per
+dataset size (measured the same subprocess-isolated way as the load
+tests). Results are specific to the machine that ran it — never copy a
+number from this script into documentation as a guarantee. Numbers from
+one real run are reported below in "Live verification results" for
+context, not as a performance commitment.
+
+### Live verification results
+
+One real run of `python scripts/benchmark_large_pipeline.py --sizes
+100000 500000 1000000`, macOS (darwin), Python 3.12.2, this project's
+reference development machine, full ingestion→packaging pipeline
+(IMU + 1/10th-rate GPS), default `duplicate_policy.backend="memory"`:
+
+| Rows | Validation | Integrity | Normalization | Synchronization | Cleaning | Transformation | Whole-run peak RSS | Wall time |
+|---|---|---|---|---|---|---|---|---|
+| 100,000 | 0.18s (552k rec/s) | 0.25s (404k rec/s) | 0.66s (150k rec/s) | 1.11s (90k rec/s) | 1.16s (86k rec/s) | 0.38s (260k rec/s) | 106.7 MB | 4.3s |
+| 500,000 | 0.90s (558k rec/s) | 1.21s (412k rec/s) | 3.32s (151k rec/s) | 5.44s (92k rec/s) | 5.83s (86k rec/s) | 1.89s (265k rec/s) | 270.5 MB | 20.3s |
+| 1,000,000 | 1.80s (557k rec/s) | 2.43s (412k rec/s) | 6.60s (152k rec/s) | 10.89s (92k rec/s) | 11.67s (86k rec/s) | 3.80s (263k rec/s) | 469.6 MB | 40.4s |
+
+Read this honestly:
+
+- **Validation/integrity/normalization/synchronization/transformation
+  throughput is essentially flat** across a 10x row-count increase
+  (e.g. validation: 552k → 558k → 557k rec/s) — exactly what an O(1)-
+  or O(bounded)-memory, single-pass stage should show; time scales
+  linearly with rows, not superlinearly.
+- **Whole-run peak RSS is not flat** (107 MB → 271 MB → 470 MB) — and it
+  should not be, with the default cleaning dedup backend: this is the
+  documented O(unique_rows) in-memory dedup index dominating the
+  process's memory footprint, exactly as the resource-complexity table
+  above predicts. This is the single biggest, most honest number in
+  this whole report: it is not a bug, it is the *default* behavior this
+  milestone explicitly measured, documented, and gave an alternative
+  for.
+- With `duplicate_policy.backend="sqlite"`, `test_load_cleaning_dedup.py`
+  measured the same 20x unique-row increase (50,000 → 1,000,000) growing
+  peak RSS by roughly 0.2 MB instead of ~187 MB — see "Dedup backend
+  behavior" above for the exact figures from that run.
+- Disk preflight correctly rejected an intentionally impossible request
+  (an astronomical `DISK_RESERVE_BYTES`) with HTTP 507, before any
+  package files were written — `tests/test_packaging_api.py::
+  test_disk_preflight_rejects_impossible_request_before_writing`.
+- A crash injected mid-way through a 50,000-row cleaning run (sqlite
+  dedup backend) left no partial finalized artifact, no leaked dedup
+  temp file, an unchanged upstream synchronized artifact and raw
+  ingestion, and the stage succeeded on immediate retry —
+  `tests/load/test_load_crash_safety.py`.
+
+### Limitations
+
+- **Not distributed, not cloud-scale.** Every number and guarantee in
+  this section is for a single machine. This milestone deliberately did
+  not add Spark/Dask/Ray/Celery/Kafka/Kubernetes/multiprocessing
+  production workers — see the v2.2 non-goals.
+  `Forge Data is designed for large single-machine workloads`, not
+  described as handling arbitrarily large datasets.
+- JSON array format, the in-memory dedup backend, and the Parquet
+  exporter are O(dataset) — see "Known non-bounded structures" above.
+  These are documented trade-offs with a stated reason, not silent gaps.
+  Prefer CSV/JSONL and the `sqlite` dedup backend for large runs.
+  PercentileBuffer beyond `MAX_QC_VALUES_PER_FEATURE` is an approximate,
+  first-encountered-order sample, not a statistically representative one
+  — check `percentiles_truncated` before trusting it at scale.
+- Disk preflight is wired into ingestion and packaging only; it is a
+  heuristic estimate, not a guarantee, and free space can still change
+  between the check and the actual write.
+- Runtime resource metrics (duration, throughput, bytes) are
+  intentionally kept out of every manifest's own hash inputs — see
+  `app.catalog.serialization` / the Step 10 lineage fingerprint, which
+  is computed only from content/config identity, never from anything
+  measured at runtime. A dataset version's `lineage_fingerprint` is
+  unaffected by how fast or slow the machine that produced it was.
+
+---
+
 ## Setup
 
 ```bash
@@ -3111,6 +3416,10 @@ Environment variables (all optional, sensible defaults provided):
 | `STAGING_DIR_NAME`          | `.staging`           | Staging subtree name for ingestion/validation/integrity (v2.1) |
 | `STALE_STAGING_AFTER_SECONDS` | `3600.0`           | Age threshold before the recovery scanner classifies a staging entry STALE |
 | `FSYNC_ENABLED`             | `true`               | fsync staged files/directories before/after atomic rename (v2.1); disabling keeps atomic visibility but drops best-effort durability |
+| `STREAM_CHUNK_BYTES`        | `1048576` (1 MiB)    | Chunk size for streamed byte-level reads (v2.2) |
+| `DISK_RESERVE_BYTES`        | `104857600` (100 MiB) | Headroom kept free beyond a stage's disk-space estimate (v2.2) |
+| `DISK_SAFETY_FACTOR`        | `1.2`                | Multiplier applied to a stage's disk-space estimate before comparing (v2.2) |
+| `MIN_FREE_DISK_BYTES`       | `52428800` (50 MiB)  | Absolute free-space floor, independent of any estimate (v2.2) |
 
 ## How raw storage works
 
@@ -3179,6 +3488,17 @@ used across several of those files.
 `multiprocessing`, synchronized deterministically with
 `multiprocessing.Event` (never sleep-based polling) so they aren't
 flaky.
+
+v2.2 adds 13 more tests to the default suite (940 total) —
+`test_disk_preflight.py`, sqlite-backend additions to
+`test_cleaning_duplicates.py` and `test_cleaning_api.py`, and one
+disk-preflight-rejection test in `test_packaging_api.py` — plus a
+separate, **opt-in** `tests/load/` suite (11 tests, run via
+`pytest -m load`, deselected by default) covering real memory
+measurement at up to 1,000,000-row scale for ingestion, CSV validation,
+cleaning-dedup backends, count-window transformation, and one combined
+large-scale-plus-crash-injection scenario. See "Load test methodology"
+above for why `load` tests are opt-in and how peak memory is measured.
 
 ## Deliberate MVP limitations
 
@@ -3495,10 +3815,40 @@ flaky.
   concurrency — all out of scope for this milestone, consistent with
   every prior step's local-first, single-process design.
 
+**v2.2:**
+- Not distributed, not cloud-scale — designed for large single-machine
+  workloads, not arbitrarily large datasets. No Spark/Dask/Ray/Celery/
+  Kafka/Kubernetes/multiprocessing production workers were introduced.
+- Disk preflight is wired into ingestion and packaging only —
+  normalization, synchronization, cleaning, and transformation don't yet
+  call `require_disk_space()`, though the same helper is ready for them.
+- No automatic memory→disk spillover for cleaning dedup — the backend is
+  an explicit per-request choice (`memory` default, `sqlite` opt-in),
+  not an auto-detected threshold.
+- JSON array format remains O(dataset) for read and write (validation,
+  integrity, normalization) — no streaming JSON parser dependency was
+  added; use CSV/JSONL for large files.
+- The optional Parquet exporter remains O(split size) — only reached
+  when a request's `exports` includes `"parquet"`; the mandatory JSONL
+  export is fully streamed.
+- QC percentiles beyond `MAX_QC_VALUES_PER_FEATURE` are a
+  first-encountered-order sample, not a statistically representative
+  one — no bounded-memory quantile sketch was introduced; check
+  `percentiles_truncated` before trusting them at scale.
+- Runtime resource metrics (duration, throughput, peak RSS) are
+  benchmark-only in v2.2 — no per-stage runtime telemetry was added to
+  persisted manifests, specifically so a lineage fingerprint never
+  depends on how fast the machine that produced it was.
+
 ## Status
 
 All 10 planned steps are complete and fully tested. v2.1 (Crash Safety &
 Atomic Artifacts) adds crash-safe, atomically-published artifacts and a
-staging recovery service across every stage's storage layer — 927 tests
-total. No Step 11 work has been started or planned as part of this
-build.
+staging recovery service across every stage's storage layer. v2.2
+(Large-scale Streaming & Resource Bounds) documents a resource contract
+for every stage, adds a scalable sqlite-backed exact-dedup option for
+cleaning, and adds disk-space preflight checks — 940 tests in the
+default suite, plus an opt-in `tests/load/` suite (11 tests,
+`pytest -m load`) exercising real memory measurement at up to
+1,000,000-row scale. No Step 11 work has been started or planned as
+part of this build.

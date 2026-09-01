@@ -15,6 +15,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.ingestion.models import IngestionResponse, Manifest, resolve_customer_id
 from app.storage.base import ArtifactAlreadyExistsError, RawStorage
+from app.storage.disk_preflight import require_disk_space
 from app.utils.filenames import extension_of, sanitize_filename
 from app.utils.ids import generate_ingestion_id, generate_session_id
 
@@ -151,6 +152,22 @@ class IngestionService:
                 session_id,
             )
             raise EmptyFileError("Uploaded file is empty")
+
+        # Disk preflight (v2.2): worst-case estimate is the configured
+        # upload ceiling itself (the actual size isn't known upfront for a
+        # streamed multipart body) -- ratio=1.0 since raw storage writes
+        # exactly the uploaded bytes, no amplification. Checked against
+        # RAW_STORAGE_ROOT directly (not through the RawStorage
+        # abstraction, which intentionally exposes no filesystem path) --
+        # accurate for the local backend this project ships today; a
+        # future non-local backend would need its own preflight.
+        require_disk_space(
+            self._settings.RAW_STORAGE_ROOT,
+            stage="ingestion",
+            estimated_required_bytes=self._settings.max_upload_size_bytes,
+            reserve_bytes=self._settings.DISK_RESERVE_BYTES,
+            safety_factor=1.0,
+        )
 
         stream_for_storage = _PrefixedStream(first_chunk, request.stream)
         limited_stream = _SizeLimitedReader(stream_for_storage, self._settings.max_upload_size_bytes)

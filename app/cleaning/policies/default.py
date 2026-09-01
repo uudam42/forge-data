@@ -17,6 +17,8 @@ short-circuit-on-drop behavior that this order depends on.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.cleaning.models import CleaningConfig
 from app.cleaning.policies.base import CleaningPolicy
 from app.cleaning.rules.base import CleaningRule
@@ -30,7 +32,9 @@ class DefaultMultimodalPolicy(CleaningPolicy):
     policy_version = "1.0.0"
     transform_version = "1.0.0"
 
-    def build_rules(self, config: CleaningConfig, *, known_streams: list[str]) -> list[CleaningRule]:
+    def build_rules(
+        self, config: CleaningConfig, *, known_streams: list[str], temp_dir: Path | None = None
+    ) -> list[CleaningRule]:
         rules: list[CleaningRule] = []
 
         if config.required_streams:
@@ -54,7 +58,7 @@ class DefaultMultimodalPolicy(CleaningPolicy):
             )
 
         if config.duplicate_policy.enabled:
-            rules.append(DuplicateRowRule())
+            rules.append(DuplicateRowRule(backend=config.duplicate_policy.backend, temp_dir=temp_dir))
 
         if config.privacy.redact_fields:
             rules.append(PrivacyRedactionRule(fields=tuple(config.privacy.redact_fields)))

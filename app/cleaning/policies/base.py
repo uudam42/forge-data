@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from app.cleaning.models import CleaningConfig
 from app.cleaning.rules.base import CleaningRule
@@ -30,10 +31,19 @@ class CleaningPolicy(ABC):
     transform_version: str
 
     @abstractmethod
-    def build_rules(self, config: CleaningConfig, *, known_streams: list[str]) -> list[CleaningRule]:
+    def build_rules(
+        self, config: CleaningConfig, *, known_streams: list[str], temp_dir: Path | None = None
+    ) -> list[CleaningRule]:
         """Returns the ordered list of rules this policy applies for the
         given effective configuration. Order matters — see
         policies/default.py for why privacy redaction must run last.
+
+        `temp_dir` (v2.2) is where a rule that needs disk-backed state
+        (e.g. DuplicateRowRule(backend="sqlite")) should put it — the
+        caller passes the run's own v2.1 staging directory, so that state
+        is automatically cleaned up on failure and never becomes part of
+        a finalized artifact. None (the default) is fine for every rule
+        that doesn't need it.
         """
         raise NotImplementedError
 

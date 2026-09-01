@@ -107,6 +107,23 @@ class Settings(BaseSettings):
     # best-effort durability guarantee -- useful only for test speed.
     FSYNC_ENABLED: bool = True
 
+    # Large-scale streaming & resource bounds (v2.2). See
+    # docs/DETAILED_GUIDE.md#large-data-execution-and-resource-model.
+
+    # Chunk size for every streamed byte-level read (ingestion upload,
+    # future chunked writers). One conservative default, not per-stage
+    # knobs -- see STREAM_CHUNK_BYTES docs for why 1 MiB.
+    STREAM_CHUNK_BYTES: int = 1024 * 1024
+
+    # Disk-space preflight (packaging, ingestion): refuse to start an
+    # expensive write when free space is obviously insufficient, rather
+    # than failing partway through. Conservative defaults deliberately
+    # small so a normal dev laptop or CI runner never trips them on a
+    # tiny test fixture.
+    DISK_RESERVE_BYTES: int = 100 * 1024 * 1024  # 100 MiB headroom kept free beyond the estimate
+    DISK_SAFETY_FACTOR: float = 1.2  # multiply the size estimate by this before comparing
+    MIN_FREE_DISK_BYTES: int = 50 * 1024 * 1024  # absolute floor, independent of any estimate
+
     APP_NAME: str = "ai-data-pipeline"
     LOG_LEVEL: str = "INFO"
 

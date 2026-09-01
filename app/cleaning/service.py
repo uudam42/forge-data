@@ -134,7 +134,6 @@ class CleaningService:
             )
 
         known_streams = sorted(s["name"] for s in manifest["streams"])
-        rules = policy.build_rules(request.config, known_streams=known_streams)
         config_hash = policy.config_hash(request.config)
 
         cleaning_id = generate_cleaning_id()
@@ -149,13 +148,26 @@ class CleaningService:
         staging_dir = self._cleaned_store.staging_dir(
             synchronization_id=synchronization_id, cleaning_id=cleaning_id
         )
+        # temp_dir=staging_dir: any rule needing disk-backed state (e.g. a
+        # sqlite-backend DuplicateRowRule) puts it inside this run's own
+        # v2.1 staging directory, so it's cleaned up by discard() on
+        # failure and explicitly closed before commit() on success (see
+        # the `finally` below) -- it never becomes part of a finalized
+        # artifact.
+        rules = policy.build_rules(request.config, known_streams=known_streams, temp_dir=staging_dir)
         metrics = CleaningMetricsAccumulator(max_detail_entries=self._settings.MAX_CLEANING_ISSUE_DETAILS)
         evaluator = RowEvaluator(rules)
 
         try:
-            cleaned_sha256, cleaned_size_bytes = self._process_rows(
-                artifact_path=artifact_path, evaluator=evaluator, metrics=metrics, staging_dir=staging_dir
-            )
+            try:
+                cleaned_sha256, cleaned_size_bytes = self._process_rows(
+                    artifact_path=artifact_path, evaluator=evaluator, metrics=metrics, staging_dir=staging_dir
+                )
+            finally:
+                for rule in rules:
+                    closer = getattr(rule, "close", None)
+                    if closer is not None:
+                        closer()
 
             status, rejection_reasons = self._determine_status(metrics, request.config)
 

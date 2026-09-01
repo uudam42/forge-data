@@ -22,6 +22,9 @@ Status codes:
 - 500: reserved for actual internal failures (a leakage invariant
   violation, a missing/duplicate sample_id — engine/data invariants Step
   7/8 are supposed to already guarantee)
+- 507: disk-space preflight (v2.2) determined the destination filesystem
+  doesn't have enough free space for the estimated output, checked
+  before any expensive write begins
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from app.packaging.profiles.base import (
     UnsupportedSplitStrategyError,
 )
 from app.packaging.registry import PackagingProfileNotFoundError, PackagingProfileRegistry
+from app.storage.errors import InsufficientDiskSpaceError
 from app.packaging.service import (
     DuplicateSampleIdError,
     MissingSampleIdError,
@@ -118,3 +122,5 @@ async def package_dataset(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except (MissingSampleIdError, DuplicateSampleIdError, LeakageInvariantViolation, SampleCountMismatch) as exc:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    except InsufficientDiskSpaceError as exc:
+        raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=exc.to_dict()) from exc

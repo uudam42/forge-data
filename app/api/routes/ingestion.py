@@ -19,6 +19,7 @@ from app.ingestion.service import (
     UploadRequest,
 )
 from app.storage.base import RawStorage
+from app.storage.errors import InsufficientDiskSpaceError
 from app.storage.local import LocalRawStorage
 
 router = APIRouter(prefix="/api/v1/ingestion", tags=["ingestion"])
@@ -70,5 +71,7 @@ async def upload(
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)) from exc
     except IngestionConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except InsufficientDiskSpaceError as exc:
+        raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=exc.to_dict()) from exc
     finally:
         await file.close()

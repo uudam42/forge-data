@@ -63,6 +63,7 @@ from app.packaging.serialization import canonical_json, compute_file_sha256
 from app.packaging.splitter import UnsupportedSplitStrategyError, assign_splits
 from app.qc.models import QCStatus
 from app.storage.atomic import write_manifest_file
+from app.storage.disk_preflight import estimate_required_bytes, require_disk_space
 from app.storage.package_store import DatasetPackageStore
 from app.storage.qc_store import QCReportStore
 from app.storage.transformed_store import TransformedArtifactStore
@@ -188,6 +189,19 @@ class PackagingService:
             request.profile_version,
             split.strategy,
             grouping_mode,
+        )
+
+        # Disk preflight (v2.2): packaging re-partitions the transformed
+        # input into train/validation/test/split_index (+ report/manifest,
+        # + optional Parquet) -- roughly input-sized output, times up to a
+        # few splits. 1.5x is a conservative, documented estimate, not a
+        # measurement; see docs/DETAILED_GUIDE.md#disk-preflight.
+        require_disk_space(
+            self._settings.PACKAGE_STORAGE_ROOT,
+            stage="packaging",
+            estimated_required_bytes=estimate_required_bytes(artifact_path.stat().st_size, ratio=1.5),
+            reserve_bytes=self._settings.DISK_RESERVE_BYTES,
+            safety_factor=self._settings.DISK_SAFETY_FACTOR,
         )
 
         staging_dir = self._package_store.staging_dir(transformation_id=transformation_id, package_id=package_id)
