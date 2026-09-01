@@ -228,15 +228,16 @@ robotics_demo @ 1.0.0
 
 ## Testing
 
-940 tests currently cover per-stage behavior, lineage gates, determinism, artifact
+1028 tests currently cover per-stage behavior, lineage gates, determinism, artifact
 immutability, checksum validation, API contracts, crash-safety/atomic-commit
-guarantees (including real subprocess kill tests), and full end-to-end pipeline runs.
+guarantees (including real subprocess kill tests), sensor plugin contracts (IMU, GPS,
+Force/Torque), and full end-to-end pipeline runs.
 
 ```bash
 pytest
 ```
 
-An additional opt-in `tests/load/` suite (11 tests, deselected by default) exercises real
+An additional opt-in `tests/load/` suite (14 tests, deselected by default) exercises real
 memory measurement at up to 1,000,000-row scale:
 
 ```bash
@@ -250,12 +251,14 @@ app/
   ingestion/ validation/ integrity/ normalization/   Per-stage services
   synchronization/ cleaning/ transformation/
   qc/ packaging/
+  sensors/            Sensor plugin architecture — imu/, gps/, force_torque/, registry
   catalog/            Lineage graph, verification, dataset registry, SQLite catalog
   storage/            Immutable artifact stores (one per stage) + catalog store
   api/routes/         FastAPI routers, one per stage
-tests/                940 tests (+ opt-in tests/load/, 11 tests, `pytest -m load`)
-schemas/              Built-in IMU / GPS schema definitions
+tests/                1028 tests (+ opt-in tests/load/, 14 tests, `pytest -m load`)
+schemas/              Built-in IMU / GPS / Force-Torque schema definitions
 docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
+docs/ADDING_SENSOR.md   Step-by-step guide to adding a new sensor plugin
 ```
 
 ## Status
@@ -274,6 +277,7 @@ The v1.0 core pipeline is complete and validated end-to-end, with:
 v2 development:
 - v2.1 Crash Safety & Atomic Artifacts — COMPLETE
 - v2.2 Large-scale Streaming & Resource Bounds — COMPLETE
+- v2.3 Sensor / Schema Plugin System — COMPLETE
 
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
@@ -286,6 +290,13 @@ backend's O(unique_rows) growth is now measured and documented, not just claimed
 disk-space preflight checks before large writes. Details:
 [Full Technical Guide § Large-data execution and resource model](docs/DETAILED_GUIDE.md#large-data-execution-and-resource-model-v22).
 
+**v2.3 (Sensor / Schema Plugin System)** turns IMU, GPS, and a new built-in 6-axis
+Force/Torque sensor into a coherent `SensorPlugin` architecture — adding a sensor is one
+plugin package and one registration line, with zero changes to synchronization, cleaning,
+QC, packaging, or catalog code (verified by an automated source-text check). See
+[docs/ADDING_SENSOR.md](docs/ADDING_SENSOR.md) for the practical guide, or
+[Full Technical Guide § Sensor plugin architecture](docs/DETAILED_GUIDE.md#sensor-plugin-architecture-v23) for the design.
+
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,
 authentication, multi-tenancy, and a web dashboard are planned for the next phase — see
@@ -295,7 +306,8 @@ authentication, multi-tenancy, and a web dashboard are planned for the next phas
 
 **Implemented:**
 - Local filesystem–backed pipeline, end to end (ingestion through packaging and catalog)
-- IMU and GPS as built-in schema/normalization-profile examples
+- IMU, GPS, and Force/Torque as built-in sensor plugins (schema, integrity, normalization,
+  features) — see [docs/ADDING_SENSOR.md](docs/ADDING_SENSOR.md) to add another
 - FastAPI HTTP API with interactive Swagger docs
 - Deterministic processing, dataset QC, and leakage-safe packaging
 - SQLite-backed metadata catalog, rebuildable from filesystem manifests
@@ -322,6 +334,7 @@ Realistic next steps, not commitments or dates:
 ## Documentation
 
 - [Full Technical Guide](docs/DETAILED_GUIDE.md) — architecture, every API and error code, per-stage design notes, MVP limitations
+- [Adding a Sensor](docs/ADDING_SENSOR.md) — step-by-step guide to adding a new sensor plugin
 - [中文文档](README.zh-CN.md)
 
 ## Contributing

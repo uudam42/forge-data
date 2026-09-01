@@ -1,17 +1,20 @@
 """Built-in transformation profile: multimodal_window_v1.
 
-Supports both windowing modes (count, time) and the two known sensor
-streams (imu, gps). This is the only profile shipped in the Step 7 MVP —
-additional profiles are a future extension point, not something the API
-route or service ever branch on directly.
+Supports both windowing modes (count, time) and any registered sensor
+plugin's stream (v2.3: resolved through app.sensors.registry, not a
+hardcoded per-sensor map) — this is the only profile shipped in the
+Step 7 MVP; additional profiles are a future extension point, not
+something the API route or service ever branch on directly.
 """
 
 from __future__ import annotations
 
+from pydantic import ValidationError
+
+from app.sensors.base import SensorPluginNotFoundError
+from app.sensors.registry import SensorPluginRegistry, get_default_registry
 from app.transformation.features.base import FeatureExtractor
-from app.transformation.features.gps import GpsFeatureExtractor
-from app.transformation.features.imu import ImuFeatureExtractor
-from app.transformation.models import StreamFeatureConfig, TransformationConfig
+from app.transformation.models import TransformationConfig
 from app.transformation.profiles.base import (
     InvalidTransformationConfigurationError,
     TransformationProfile,
@@ -20,17 +23,15 @@ from app.transformation.profiles.base import (
 
 _WINDOW_MODES = ("count", "time")
 
-_STREAM_EXTRACTORS: dict[str, type[FeatureExtractor]] = {
-    "imu": ImuFeatureExtractor,
-    "gps": GpsFeatureExtractor,
-}
-
 
 class MultimodalWindowProfile(TransformationProfile):
     profile_name = "multimodal_window_v1"
     profile_version = "1.0.0"
     transform_version = "1.0.0"
     permitted_window_modes = _WINDOW_MODES
+
+    def __init__(self, sensor_registry: SensorPluginRegistry | None = None) -> None:
+        self._sensor_registry = sensor_registry or get_default_registry()
 
     def validate_config(
         self,
@@ -71,11 +72,10 @@ class MultimodalWindowProfile(TransformationProfile):
                     f"window.duration_ms {window.duration_ms} exceeds the configured maximum {max_time_window_ms}"
                 )
 
-        requested: dict[str, StreamFeatureConfig] = {}
-        if config.features.imu is not None:
-            requested["imu"] = config.features.imu
-        if config.features.gps is not None:
-            requested["gps"] = config.features.gps
+        try:
+            requested = config.features.stream_configs()
+        except ValidationError as exc:
+            raise InvalidTransformationConfigurationError(f"Invalid feature configuration: {exc}") from exc
 
         for stream_name, stream_config in requested.items():
             if stream_name not in known_streams:
@@ -83,15 +83,25 @@ class MultimodalWindowProfile(TransformationProfile):
                     f"Features requested for stream '{stream_name}', which is not part of this "
                     f"cleaning run's lineage (known streams: {sorted(known_streams)})"
                 )
-            extractor = _STREAM_EXTRACTORS[stream_name]()
-            extractor.validate_config(stream_config)
+            try:
+                plugin = self._sensor_registry.get(stream_name)
+            except SensorPluginNotFoundError as exc:
+                raise InvalidTransformationConfigurationError(
+                    f"Features requested for stream '{stream_name}', which has no registered sensor "
+                    f"plugin (available: {sorted(p.sensor_type for p in self._sensor_registry.list_plugins())})"
+                ) from exc
+            if plugin.feature_extractor is None:
+                raise InvalidTransformationConfigurationError(
+                    f"Sensor plugin '{stream_name}' does not provide a feature extractor"
+                )
+            plugin.feature_extractor.validate_config(stream_config)
 
     def build_extractors(self, config: TransformationConfig) -> dict[str, FeatureExtractor]:
         extractors: dict[str, FeatureExtractor] = {}
-        if config.features.imu is not None:
-            extractors["imu"] = ImuFeatureExtractor()
-        if config.features.gps is not None:
-            extractors["gps"] = GpsFeatureExtractor()
+        for stream_name in config.features.stream_configs():
+            plugin = self._sensor_registry.get(stream_name)
+            if plugin.feature_extractor is not None:
+                extractors[stream_name] = plugin.feature_extractor
         return extractors
 
 

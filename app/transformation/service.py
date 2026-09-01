@@ -157,7 +157,13 @@ class TransformationService:
         )
 
         extractors = profile.build_extractors(request.config)
-        feature_configs = {name: getattr(request.config.features, name) for name in extractors}
+        # stream_configs() (v2.3), not getattr(): a plugin's stream name
+        # may only exist via FeaturesConfig's extra="allow" capture (no
+        # declared attribute), and extra values arrive as raw dicts, not
+        # validated StreamFeatureConfig instances -- stream_configs()
+        # handles both the named (imu/gps) and generic-extra cases
+        # uniformly. See app.transformation.models.FeaturesConfig.
+        feature_configs = request.config.features.stream_configs()
         config_hash = profile.config_hash(request.config)
 
         transformation_id = generate_transformation_id()

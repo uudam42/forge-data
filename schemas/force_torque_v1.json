@@ -1,0 +1,52 @@
+{
+  "schema_name": "force_torque",
+  "schema_version": "1.0.0",
+  "record_type": "tabular",
+  "fields": {
+    "timestamp": {
+      "type": "datetime",
+      "required": true,
+      "nullable": false,
+      "format": "iso8601"
+    },
+    "force_x": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "force_y": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "force_z": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "torque_x": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "torque_y": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "torque_z": {
+      "type": "float",
+      "required": true,
+      "nullable": false
+    },
+    "device_id": {
+      "type": "string",
+      "required": false,
+      "nullable": true
+    }
+  },
+  "allow_extra_fields": false,
+  "metadata_requirements": {
+    "sensor_type": "force_torque"
+  }
+}

@@ -27,6 +27,7 @@ Step 9  Dataset Packaging          COMPLETE
 Step 10 Versioning + Lineage       COMPLETE
 v2.1    Crash Safety + Atomic Artifacts (cross-cutting, not a stage) COMPLETE
 v2.2    Large-scale Streaming + Resource Bounds (cross-cutting, not a stage) COMPLETE
+v2.3    Sensor / Schema Plugin System (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -3317,6 +3318,291 @@ Read this honestly:
 
 ---
 
+## Sensor plugin architecture (v2.3)
+
+Not a new pipeline stage — a cross-cutting extensibility upgrade. The
+question it answers: **if a robotics engineer wants to add a new sensor
+type tomorrow, what exactly do they have to implement?** The answer, for
+a normal tabular time-series sensor: one plugin package and one
+registration line — see `docs/ADDING_SENSOR.md` for the practical
+walkthrough. This section documents the architecture behind that answer.
+
+### Pre-refactor coupling audit
+
+Before writing any v2.3 code, every extension point was read directly
+(not assumed from prior docs). Finding: this codebase was **already**
+far more generic than a first guess would suggest.
+
+| Component | Pre-v2.3 mechanism | Sensor coupling found | Change needed |
+|---|---|---|---|
+| Validation | format-based (`ValidatorRegistry`, keyed by file extension) | none — validators are schema-driven, not sensor-aware | none |
+| Integrity | `IntegrityCheckerRegistry`, a hardcoded `{"imu": ..., "gps": ...}` dict built in `__init__` | closed map — adding a sensor meant editing this file | build the map from the sensor registry instead |
+| Normalization engine (`RecordNormalizer`) | one generic engine interpreting any declarative `NormalizationProfile` | none — already fully generic | none |
+| Normalization registry | hardcoded `_BUILTIN_PROFILES` tuple | closed map, same shape as integrity's | build from the sensor registry |
+| Synchronization (readers, cursors, alignment strategies, clock correction, fixed-rate timeline) | schema-field-type-driven (`FieldType.FLOAT`/`INTEGER` → interpolate, else → nearest) | **none found** | none |
+| Cleaning (rules) | operates on generic `row["streams"][name]` payloads | none | none |
+| Transformation feature dispatch (`FeatureEngine`) | already takes an `extractors: dict[str, FeatureExtractor]` built by the caller | none in the engine itself | none |
+| Transformation profile (`MultimodalWindowProfile`) | hardcoded `_STREAM_EXTRACTORS` dict + `FeaturesConfig` with explicit `imu`/`gps` Pydantic fields | closed map + closed request schema | resolve extractors from the sensor registry; make `FeaturesConfig` accept any registered sensor's stream name |
+| QC (feature discovery) | recursive over whatever transformed samples contain | none | none |
+| Packaging (grouping/splitting) | operates on sample metadata (`SampleRecord`), never content | none | none |
+| Catalog | artifact-type-keyed, never sensor-keyed | none | none |
+
+**The real coupling was narrow and specific**: three registries
+(integrity, normalization, transformation-feature-dispatch) each
+independently hardcoded which sensors exist, and could in principle
+disagree with each other. Everything downstream of normalized records
+(synchronization, cleaning, QC, packaging, catalog) was already sensor-
+agnostic by construction, well before v2.3 existed. This audit is why
+v2.3's actual code changes are much smaller than "a plugin system"
+might suggest — see "Extension cost" below.
+
+### The SensorPlugin contract
+
+`app/sensors/base.py` — `SensorPlugin` is a frozen dataclass, not a "god
+object": every field is either an instance of an abstraction that
+already existed before v2.3 (`IntegrityChecker`, `NormalizationProfile`,
+`FeatureExtractor`) or plain declarative metadata.
+
+```python
+@dataclass(frozen=True)
+class SensorPlugin:
+    sensor_type: str              # == schema_name == sync stream name == extractor stream_name
+    plugin_version: str
+    display_name: str
+    schema_version: str
+    integrity_checker: IntegrityChecker
+    normalization_profile: NormalizationProfile
+    feature_extractor: FeatureExtractor | None = None
+    timestamp_field: str = "timestamp"
+    numeric_fields: tuple[str, ...] = ()
+    required_fields: tuple[str, ...] = ()
+    canonical_units: dict[str, str] = {}
+```
+
+`__post_init__` enforces internal consistency at *registration* time,
+never at request time: the normalization profile's `schema_name` and
+`schema_version` must match the plugin's own, and a feature extractor's
+`stream_name` must equal the plugin's `sensor_type`. A structurally
+inconsistent plugin fails to construct, full stop —
+`InvalidSensorPluginError` — rather than surfacing as a confusing
+mismatch three requests later.
+
+`sensor_type` is deliberately not a new identity: it's the one string
+that IMU and GPS already used consistently as their schema name,
+integrity-registry key, synchronization stream name, and
+feature-extractor `stream_name` — v2.3 names that existing informal
+convention, it doesn't invent a sixth one.
+
+### Registry design
+
+`app/sensors/registry.py` — `SensorPluginRegistry`: `register()`
+(rejects a duplicate `sensor_type` — `DuplicateSensorPluginError`),
+`get()` (raises `SensorPluginNotFoundError` with the requested type and
+every available type listed), `list_plugins()` (deterministic,
+sorted-by-key ordering), `is_registered()`.
+
+Discovery is explicit and static (Design Requirement 22): no filesystem
+scanning, no importlib entry points, no dynamic module execution.
+`register_builtin_plugins(registry)` is a plain function that calls
+`.register()` once per built-in — adding a sensor is adding one call to
+this function, not teaching the registry to find plugins on its own.
+
+**The coordination mechanism**: `IntegrityCheckerRegistry`,
+`NormalizationProfileRegistry`, and `MultimodalWindowProfile` each now
+build their internal map **from** a `SensorPluginRegistry` instead of
+hardcoding their own — e.g.:
+
+```python
+# app/integrity/registry.py
+self._checkers = {p.sensor_type: p.integrity_checker for p in registry.list_plugins()}
+```
+
+Every one of these three classes keeps its **exact pre-v2.3 public
+interface** (`IntegrityCheckerRegistry.get()`/`.supports()`,
+`NormalizationProfileRegistry.get()`/`.list_profiles()`,
+`MultimodalWindowProfile.validate_config()`/`.build_extractors()`) — no
+caller of any of them changed. This is what "one sensor registration →
+pipeline extension points become available coherently" means in
+practice: register once, and all three become aware of it
+simultaneously, by construction, never by keeping three lists in sync
+by hand.
+
+### IMU / GPS migration
+
+`app/sensors/imu.py` and `app/sensors/gps.py` are pure composition —
+each builds one `SensorPlugin` instance out of the pre-existing,
+**unchanged** `ImuIntegrityChecker`/`GpsIntegrityChecker`,
+`IMU_CANONICAL_V1`/`GPS_CANONICAL_V1`, and
+`ImuFeatureExtractor`/`GpsFeatureExtractor` objects. No IMU or GPS
+behavior, threshold, alias, artifact format, or determinism changed —
+the full pre-existing IMU/GPS test suite (940 tests going into v2.3)
+passes unchanged, proving this was metadata-only reorganization, not a
+rewrite.
+
+### Force/Torque: the proof sensor
+
+A generic 6-axis force/torque sensor — canonical fields `timestamp`,
+`force_x/y/z` (N), `torque_x/y/z` (N·m), `device_id`. Not modeled on any
+specific manufacturer.
+
+**Supported unit conversions** (exact, factor-based, in
+`app.normalization.transforms.units`):
+
+| Dimension | Source unit | Factor to canonical |
+|---|---|---|
+| Force | N (canonical) | 1.0 |
+| Force | kN | 1000.0 |
+| Force | lbf | 4.4482216152605 (exact: 1 lbf = 1 lbm × standard gravity) |
+| Torque | N·m / N*m (canonical) | 1.0 |
+| Torque | mN·m / mN*m | 0.001 |
+| Torque | lbf·ft / lbf*ft | 1.3558179483314004 (lbf factor × 0.3048 m/ft) |
+
+Both an ASCII (`N*m`) and a Unicode middle-dot (`N·m`) spelling are
+accepted as equivalent source units — the canonical unit itself is
+reported as `N·m`.
+
+**Integrity**: `ForceTorqueIntegrityChecker` — finiteness on every
+component, the existing generic `TimestampSequenceChecker` for
+ordering/duplicates, and `ForceTorqueThresholds`
+(`max_abs_force_n`/`max_abs_torque_nm`) — both `None` (disabled) by
+default. Real force/torque sensors span an enormous operating range
+(a fingertip sensor vs. a robot base mount); this project asserts no
+universal "correct" magnitude, and an exceeded threshold is always a
+WARNING, never a hard ERROR.
+
+**Normalization**: `FORCE_TORQUE_CANONICAL_V1` — a purely declarative
+`NormalizationProfile` (aliases `fx/fy/fz/tx/ty/tz` → canonical names).
+Zero new normalization *engine* code was needed — `RecordNormalizer`
+already interprets any profile generically.
+
+**Features**: `ForceTorqueFeatureExtractor` — raw sequences, per-axis
+statistics, and two deterministic derived magnitudes:
+`force_magnitude = sqrt(force_x² + force_y² + force_z²)`,
+`torque_magnitude = sqrt(torque_x² + torque_y² + torque_z²)`. No
+contact/grasp inference, no fabricated labels, no learned models —
+consistent with this project's existing feature-extraction philosophy
+(compare `ImuFeatureExtractor`'s `accel_magnitude`/`gyro_magnitude`).
+
+### Compatibility: `FeaturesConfig`
+
+The one generic-infrastructure change genuinely required to support a
+*third* sensor's transformation features:
+`app.transformation.models.FeaturesConfig` changed from
+`model_config = ConfigDict(extra="forbid")` with only `imu`/`gps`
+declared fields to `extra="allow"` plus a `stream_configs()` method that
+merges the named fields with any extra (any other registered sensor's)
+key. This is additive and backward compatible — every existing
+`{"features": {"imu": {...}, "gps": {...}}}` request parses identically
+to before. A `FeaturesConfig` block for an unregistered sensor name (or
+one that has no feature extractor) still fails configuration validation
+— just one layer later, inside `MultimodalWindowProfile.validate_config`
+against the live sensor registry, instead of at Pydantic parse time —
+preserving the "no unknown feature is ever silently ignored" guarantee.
+This was the **only** structural change to `app/transformation/models.py`;
+Force/Torque itself required zero further edits to that file.
+
+### Version semantics
+
+Three independent version axes already existed before v2.3 and are
+**not** duplicated by plugin versioning:
+
+- **`schema_version`** — the structural contract (`schemas/*.json`).
+  Bump when required/optional fields, types, or the schema's own shape
+  change.
+- **`normalization_profile_version`** — the normalization logic/config
+  targeting a schema version. Bump when aliases, unit dimensions, or
+  conversion behavior change, independent of the schema.
+- **`plugin_version`** (v2.3, new) — the plugin *descriptor* itself
+  (which checker/profile/extractor objects are bundled, and their own
+  declared metadata). In practice this only needs to move when the
+  bundle's composition changes — swapping which profile/checker a
+  plugin exposes — not on every profile-internal tweak, which is
+  already covered by `normalization_profile_version`.
+
+Lineage already captures `schema_name`/`schema_version` and
+`profile_name`/`profile_version` in every normalization manifest (see
+Step 4/`NormalizationManifest`) — this is unchanged and is the
+provenance axis the reproducibility fingerprint and catalog lineage
+already rely on. `plugin_version` is not separately written into
+manifests: for v2.3's built-ins, the profile/checker bundle's identity
+*is* the plugin's identity, so duplicating a second version field would
+track the same fact twice. A future plugin whose descriptor genuinely
+diverges from its profile's own versioning should reconsider whether
+its profile_version already covers the distinction before adding a new
+lineage field.
+
+### API discovery
+
+`GET /api/v1/sensors` and `GET /api/v1/sensors/{sensor_type}`
+(`app/api/routes/sensors.py`) — read-only, metadata-only (never an
+implementation object). An unknown `sensor_type` returns a structured
+`404` naming both the requested type and every available one, mirroring
+this project's existing "never a generic KeyError/500" convention (see
+`SensorPluginNotFoundError`).
+
+### Compatibility guarantees
+
+- Existing IMU/GPS requests (schema names, profile names, endpoint
+  paths) are unchanged — a client written against v1.0/v2.1/v2.2 needs
+  no changes.
+- No new required request field was introduced; `sensor_type` is
+  resolved internally from `schema_name`/stream name, exactly as
+  before.
+- The full pre-v2.3 test suite (940 tests) passes unchanged, proving
+  the migration altered no observable behavior for IMU/GPS.
+
+### Extension cost
+
+After the plugin framework existed, adding Force/Torque touched:
+
+**Force/Torque-specific files (new, 6):**
+`app/sensors/force_torque/{__init__.py,plugin.py,integrity.py,normalization.py,features.py}`,
+`schemas/force_torque_v1.json`.
+
+**Generic-infrastructure files changed to support pluggability in general
+(built once, before Force/Torque existed as a concept — not
+Force/Torque-specific):**
+`app/sensors/base.py`, `app/sensors/registry.py`, `app/sensors/imu.py`,
+`app/sensors/gps.py` (new); `app/integrity/registry.py`,
+`app/normalization/registry.py`,
+`app/transformation/profiles/multimodal_window.py`,
+`app/transformation/models.py` (`FeaturesConfig`),
+`app/transformation/service.py` (one line: `feature_configs =
+request.config.features.stream_configs()`),
+`app/normalization/transforms/units.py` (+`FORCE`/`TORQUE` constants —
+data, not logic), `app/integrity/models.py` (+2 enum members),
+`app/api/routes/sensors.py`, `app/sensors/models.py` (new).
+
+**Core files that did NOT change:** every file under
+`app/synchronization/`, `app/cleaning/`, `app/qc/`, `app/packaging/`,
+`app/catalog/`. `tests/sensors/test_static_architecture.py` proves this
+directly — a source-text search across every generic-core module for
+the literal string `force_torque`, asserting zero matches, run as part
+of the normal test suite (not opt-in).
+
+### Limitations
+
+- Discovery is static and explicit only — no filesystem plugin
+  scanning, no importlib entry points, no third-party plugin
+  installation. This is deliberate (Design Requirement 22); a dynamic
+  discovery mechanism is a distinct, later concern with its own
+  security surface (arbitrary code execution from a discovered module).
+- No plugin sandboxing — a built-in plugin is trusted code in this
+  process, same as every other module in this codebase.
+- `plugin_version` is not independently recorded in lineage for v2.3's
+  built-ins (see "Version semantics" above) — if a future plugin's
+  identity genuinely needs to diverge from its profile's own
+  versioning, that will need a deliberate lineage-schema decision, not
+  an automatic one.
+- Camera/image, ROS bag, and point-cloud/LiDAR sensor types are
+  explicitly out of scope for v2.3 — this milestone is about the
+  extension *architecture* for tabular time-series sensors, not about
+  supporting every physical-AI data modality.
+
+See `docs/ADDING_SENSOR.md` for the practical, step-by-step guide.
+
+---
+
 ## Setup
 
 ```bash
@@ -3499,6 +3785,20 @@ measurement at up to 1,000,000-row scale for ingestion, CSV validation,
 cleaning-dedup backends, count-window transformation, and one combined
 large-scale-plus-crash-injection scenario. See "Load test methodology"
 above for why `load` tests are opt-in and how peak memory is measured.
+
+v2.3 adds 88 more tests to the default suite (1028 total) under
+`tests/sensors/` — plugin registration/duplicate/unknown-key/metadata
+tests, a shared contract suite (`tests/sensors/contract.py`) run against
+all three built-ins (IMU, GPS, Force/Torque), Force/Torque validation/
+integrity/normalization/synchronization/cleaning/transformation/QC/
+packaging/lineage/reliability tests, the sensor discovery API, and a
+static-architecture test asserting zero `force_torque` string matches
+across every generic-core module (synchronization, cleaning, QC,
+packaging, catalog) — the direct, automated proof behind this
+document's "Extension cost" claims. Plus 3 more **opt-in**
+`tests/load/` tests (14 total, `pytest -m load`) proving Force/Torque
+validation/normalization/transformation stay within v2.2's bounded-
+memory contracts at 1,000,000-row scale.
 
 ## Deliberate MVP limitations
 
@@ -3840,6 +4140,24 @@ above for why `load` tests are opt-in and how peak memory is measured.
   persisted manifests, specifically so a lineage fingerprint never
   depends on how fast the machine that produced it was.
 
+**v2.3:**
+- Discovery is static and explicit only — no filesystem plugin
+  scanning, no importlib entry points, no dynamic third-party package
+  installation, no plugin sandboxing. A future third-party plugin
+  mechanism is a distinct, later concern (it has its own security
+  surface: arbitrary code execution from a discovered module).
+- `plugin_version` is not independently recorded in lineage for the
+  three built-ins — their profile/checker bundle identity already
+  covers implementation identity; see "Version semantics" above.
+- Only tabular time-series sensors are addressed — camera/image
+  decoding, video pipelines, ROS bag ingestion, PointCloud2/LiDAR
+  processing remain out of scope; this milestone is about the
+  extension architecture, not about supporting every physical-AI data
+  modality.
+- No dynamic sensor-type inference of any kind — a request must always
+  name an explicit `schema_name`/`profile_name`/stream name; nothing is
+  guessed from file content or column names.
+
 ## Status
 
 All 10 planned steps are complete and fully tested. v2.1 (Crash Safety &
@@ -3847,8 +4165,12 @@ Atomic Artifacts) adds crash-safe, atomically-published artifacts and a
 staging recovery service across every stage's storage layer. v2.2
 (Large-scale Streaming & Resource Bounds) documents a resource contract
 for every stage, adds a scalable sqlite-backed exact-dedup option for
-cleaning, and adds disk-space preflight checks — 940 tests in the
-default suite, plus an opt-in `tests/load/` suite (11 tests,
-`pytest -m load`) exercising real memory measurement at up to
-1,000,000-row scale. No Step 11 work has been started or planned as
-part of this build.
+cleaning, and adds disk-space preflight checks. v2.3 (Sensor / Schema
+Plugin System) introduces a coherent `SensorPlugin` architecture,
+migrates IMU and GPS onto it with zero behavior change, and adds a
+third built-in Force/Torque sensor as proof — confirmed by a static test
+that zero synchronization/cleaning/QC/packaging/catalog file mentions
+"force_torque" — 1028 tests in the default suite, plus an opt-in
+`tests/load/` suite (14 tests, `pytest -m load`) exercising real memory
+measurement at up to 1,000,000-row scale, now including Force/Torque.
+No Step 11 work has been started or planned as part of this build.

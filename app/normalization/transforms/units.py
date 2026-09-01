@@ -22,6 +22,10 @@ FEET_TO_METERS = 0.3048
 KMH_TO_MPS = 1000.0 / 3600.0
 MPH_TO_MPS = 0.44704
 
+# Exact (defined) conversion factor: 1 lbf = 1 lbm * standard gravity.
+LBF_TO_NEWTONS = 4.4482216152605
+LBF_FT_TO_NEWTON_METERS = LBF_TO_NEWTONS * FEET_TO_METERS
+
 
 @dataclass(frozen=True)
 class UnitDimension:
@@ -60,4 +64,16 @@ SPEED = UnitDimension(
     name="speed",
     canonical_unit="m/s",
     factors={"m/s": 1.0, "km/h": KMH_TO_MPS, "mph": MPH_TO_MPS},
+)
+
+FORCE = UnitDimension(
+    name="force",
+    canonical_unit="N",
+    factors={"N": 1.0, "kN": 1000.0, "lbf": LBF_TO_NEWTONS},
+)
+
+TORQUE = UnitDimension(
+    name="torque",
+    canonical_unit="N·m",
+    factors={"N*m": 1.0, "N·m": 1.0, "mN*m": 0.001, "mN·m": 0.001, "lbf*ft": LBF_FT_TO_NEWTON_METERS, "lbf·ft": LBF_FT_TO_NEWTON_METERS},
 )

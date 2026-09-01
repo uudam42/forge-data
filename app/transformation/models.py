@@ -90,16 +90,38 @@ class StreamFeatureConfig(BaseModel):
 
 
 class FeaturesConfig(BaseModel):
-    # extra="forbid": a feature block for a stream this profile doesn't
-    # model (e.g. "lidar") — or a misspelled key — must fail configuration
-    # validation, never be silently dropped (see Step 7's "no unknown
-    # feature is ever silently ignored" requirement).
-    model_config = ConfigDict(extra="forbid")
+    # extra="allow" (v2.3): a feature block for ANY registered sensor
+    # plugin's stream name is accepted, not just imu/gps — this is the
+    # one change that let Force/Torque (and any future sensor plugin)
+    # request features without editing this model again. `imu`/`gps`
+    # stay explicit named fields for OpenAPI/docs clarity and exact
+    # backward compatibility; every other key arrives via Pydantic's
+    # extra-field capture. A feature block for a stream that ISN'T a
+    # registered sensor plugin, or ISN'T part of this run's lineage,
+    # still fails configuration validation — just one layer later, in
+    # MultimodalWindowProfile.validate_config, instead of at parse time
+    # (see Step 7's "no unknown feature is ever silently ignored"
+    # requirement, which this preserves).
+    model_config = ConfigDict(extra="allow")
 
     imu: StreamFeatureConfig | None = None
     gps: StreamFeatureConfig | None = None
     include_modality_mask: bool = True
     include_relative_time: bool = False
+
+    def stream_configs(self) -> dict[str, StreamFeatureConfig]:
+        """Every configured per-stream feature block, generic across
+        sensor plugins. Raises pydantic.ValidationError (translated by
+        the caller into InvalidTransformationConfigurationError) if an
+        extra block doesn't match StreamFeatureConfig's own shape."""
+        result: dict[str, StreamFeatureConfig] = {}
+        if self.imu is not None:
+            result["imu"] = self.imu
+        if self.gps is not None:
+            result["gps"] = self.gps
+        for key, value in (self.model_extra or {}).items():
+            result[key] = StreamFeatureConfig.model_validate(value)
+        return result
 
 
 class TransformationConfig(BaseModel):

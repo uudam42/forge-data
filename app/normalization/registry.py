@@ -5,15 +5,17 @@ Profile versioning is kept explicitly separate from schema versioning:
 normalization logic can evolve (a new profile_version) without touching the
 schema it targets, and lookup is always explicit — never "latest" or
 implicit fallback.
+
+(v2.3) The map is built from the sensor plugin registry
+(app.sensors.registry) instead of hardcoding IMU/GPS profile imports
+directly. The public interface (`get`, `list_profiles`) is unchanged
+from v1.0.
 """
 
 from __future__ import annotations
 
 from app.normalization.profiles.base import NormalizationProfile
-from app.normalization.profiles.gps import GPS_CANONICAL_V1
-from app.normalization.profiles.imu import IMU_CANONICAL_V1
-
-_BUILTIN_PROFILES = (IMU_CANONICAL_V1, GPS_CANONICAL_V1)
+from app.sensors.registry import SensorPluginRegistry, get_default_registry
 
 
 class NormalizationProfileNotFoundError(Exception):
@@ -21,10 +23,11 @@ class NormalizationProfileNotFoundError(Exception):
 
 
 class NormalizationProfileRegistry:
-    def __init__(self) -> None:
+    def __init__(self, sensor_registry: SensorPluginRegistry | None = None) -> None:
+        registry = sensor_registry or get_default_registry()
         self._profiles: dict[tuple[str, str, str, str], NormalizationProfile] = {
             (p.schema_name, p.schema_version, p.profile_name, p.profile_version): p
-            for p in _BUILTIN_PROFILES
+            for p in (plugin.normalization_profile for plugin in registry.list_plugins())
         }
 
     def get(

@@ -14,6 +14,7 @@ from app.api.routes.normalization import router as normalization_router
 from app.api.routes.packaging import router as packaging_router
 from app.api.routes.qc import router as qc_router
 from app.api.routes.recovery import router as recovery_router
+from app.api.routes.sensors import router as sensors_router
 from app.api.routes.synchronization import router as synchronization_router
 from app.api.routes.transformation import router as transformation_router
 from app.api.routes.validation import router as validation_router
@@ -53,6 +54,7 @@ app.include_router(catalog_router)
 app.include_router(lineage_router)
 app.include_router(datasets_router)
 app.include_router(recovery_router)
+app.include_router(sensors_router)
 
 
 @app.get("/health", response_model=HealthResponse)
