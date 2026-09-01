@@ -142,6 +142,38 @@ class Settings(BaseSettings):
     DISK_SAFETY_FACTOR: float = 1.2  # multiply the size estimate by this before comparing
     MIN_FREE_DISK_BYTES: int = 50 * 1024 * 1024  # absolute floor, independent of any estimate
 
+    # Pipeline runs and observability (v2.6). See
+    # docs/DETAILED_GUIDE.md#pipeline-runs-and-observability-v26.
+
+    # A running/cancel_requested run whose executor hasn't updated
+    # last_heartbeat_at within this many seconds is presumed to have lost
+    # its owning process -- the startup RunRecoveryService marks it
+    # failed with RUN_PROCESS_LOST rather than leaving it "running"
+    # forever. Deliberately conservative (much larger than the heartbeat
+    # interval below) so a briefly-slow process is never mistaken dead.
+    RUN_STALE_HEARTBEAT_SECONDS: float = 30.0
+
+    # How often a running pipeline updates last_heartbeat_at and re-checks
+    # for a cancellation request. One shared interval for both -- both are
+    # cheap reads/writes of the same run row, and both need to be frequent
+    # enough for a human to notice, not so frequent they add real overhead.
+    RUN_HEARTBEAT_INTERVAL_SECONDS: float = 2.0
+
+    # How often DatabaseProgressReporter is allowed to actually write
+    # progress to SQLite, regardless of how often callers report
+    # progress -- see Design Requirement 15. A record-by-record DB write
+    # would dominate processing cost at scale; this bounds it to wall-clock
+    # time instead of record count, so it behaves the same regardless of
+    # per-record cost.
+    PROGRESS_UPDATE_INTERVAL_MS: float = 500.0
+
+    # Local-first resource safety: how many pipeline/selective_rebuild runs
+    # may be actively "running" at once, counted across every process
+    # sharing this workspace's catalog.db (this is not a per-process
+    # limit). A new run request beyond this is rejected immediately with a
+    # structured LOCAL_RUN_CAPACITY_EXCEEDED error -- there is no queue.
+    MAX_LOCAL_PIPELINE_RUNS: int = 2
+
     APP_NAME: str = "ai-data-pipeline"
     LOG_LEVEL: str = "INFO"
 

@@ -280,6 +280,7 @@ v2 development:
 - v2.3 Sensor / Schema Plugin System — COMPLETE
 - v2.4 Multiprocess Concurrency & SQLite Safety — COMPLETE
 - v2.5 Data Governance & Selective Rebuild — COMPLETE
+- v2.6 Pipeline Runs, Progress, Cancellation & Observability — COMPLETE
 
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
@@ -317,6 +318,16 @@ branch — reusing every unaffected sibling parent unchanged — while the old b
 dataset version stay fully intact and inspectable. This is governance-aware lineage and
 descendant rebuild planning, not automatic repair or a job orchestrator. Details:
 [Full Technical Guide § Data governance and selective rebuild](docs/DETAILED_GUIDE.md#data-governance-and-selective-rebuild-v25).
+
+**v2.6 (Pipeline Runs, Progress, Cancellation & Observability)** adds a first-class,
+durable `PipelineRun`/`StageRun` execution model: submit a multi-stream (IMU/GPS/Force-Torque)
+pipeline as one run, poll its status/progress/produced artifacts, request cooperative
+cancellation, and see a v2.5 selective rebuild's own observable run record. Progress and
+structured execution status are honest and throttled — never a fabricated percentage — and a
+process crash is reconciled to a clean failed state at the next startup, never an automatic
+resume. This is local-process execution with durable run metadata, not a distributed job
+queue. Details:
+[Full Technical Guide § Pipeline runs and observability](docs/DETAILED_GUIDE.md#pipeline-runs-and-observability-v26).
 
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,

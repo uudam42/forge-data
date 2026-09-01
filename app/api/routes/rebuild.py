@@ -18,6 +18,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.routes.catalog import get_catalog_service, raise_busy
+from app.api.routes.runs import get_run_service
 from app.catalog.errors import (
     ArtifactNotFoundError,
     CatalogBusyError,
@@ -29,6 +30,7 @@ from app.catalog.errors import (
 )
 from app.catalog.rebuild_models import RebuildExecuteRequest, RebuildExecuteResponse, RebuildPlanRequest, RebuildPlanResponse
 from app.catalog.service import CatalogService
+from app.runs.service import RunService
 
 router = APIRouter(prefix="/api/v1/rebuild", tags=["rebuild"])
 
@@ -51,9 +53,13 @@ async def build_plan(request: RebuildPlanRequest, service: CatalogService = Depe
 
 
 @router.post("/execute", response_model=RebuildExecuteResponse, status_code=status.HTTP_200_OK)
-async def execute_plan(request: RebuildExecuteRequest, service: CatalogService = Depends(get_catalog_service)) -> RebuildExecuteResponse:
+async def execute_plan(
+    request: RebuildExecuteRequest,
+    service: CatalogService = Depends(get_catalog_service),
+    run_service: RunService = Depends(get_run_service),
+) -> RebuildExecuteResponse:
     try:
-        return service.execute_rebuild(plan_id=request.plan_id, configs=request.configs)
+        response = service.execute_rebuild(plan_id=request.plan_id, configs=request.configs)
     except RebuildPlanNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.to_dict()) from exc
     except RebuildPlanStaleError as exc:
@@ -62,3 +68,14 @@ async def execute_plan(request: RebuildExecuteRequest, service: CatalogService =
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.to_dict()) from exc
     except CatalogBusyError as exc:
         raise_busy(exc)
+
+    # v2.6 Design Requirement 31: observable run state for a rebuild
+    # execution, without touching SelectiveRebuildExecutor at all --
+    # recorded post-hoc from the already-complete result above.
+    try:
+        run_service.record_selective_rebuild_run(plan_id=request.plan_id, configs=request.configs, response=response)
+    except Exception:
+        import logging
+
+        logging.getLogger("app.runs.service").exception("SELECTIVE_REBUILD_RUN_RECORD_FAILED plan_id=%s", request.plan_id)
+    return response

@@ -166,6 +166,10 @@ class CatalogService:
         # to be true") per Design Requirement 25.
         artifact_governance_before = len(self._repo.list_all_artifact_governance())
         version_governance_before = len(self._repo.list_all_dataset_version_governance())
+        # v2.6 -- run metadata is user/operational-owned catalog state,
+        # exactly like governance; clear_artifact_index() never
+        # references these tables either. Design Requirement 57.
+        run_tables_before = self._repo.count_run_tables()
         try:
             with self._rebuild_lock():
                 with self._repo.transaction(operation="rebuild"):
@@ -203,6 +207,7 @@ class CatalogService:
         version_governance_after = len(self._repo.list_all_dataset_version_governance())
         assert artifact_governance_after == artifact_governance_before, "rebuild must never alter artifact governance"
         assert version_governance_after == version_governance_before, "rebuild must never alter dataset-version governance"
+        assert self._repo.count_run_tables() == run_tables_before, "rebuild must never alter run metadata"
         return RebuildResult(
             artifacts_registered=outcome.inserted,
             edges_registered=outcome.edges_inserted,
@@ -253,6 +258,22 @@ class CatalogService:
                     HealthIssue(
                         code="BROKEN_GOVERNANCE_REFERENCE",
                         detail=f"governance state {gov['state']!r} recorded for {gov['artifact_type']}/{gov['artifact_id']}, "
+                        f"which is no longer in the artifact index",
+                    )
+                )
+
+        # v2.6 -- a run_artifacts row pointing at an artifact that's no
+        # longer in the index is the same kind of dangling-but-preserved
+        # reference as broken governance above: never deleted (that would
+        # destroy operational run history), just surfaced. A run itself
+        # failing/being cancelled is never a health issue either -- see
+        # Design Requirement 58.
+        for ra in self._repo.list_all_run_artifacts():
+            if self._repo.get_artifact(ra["artifact_type"], ra["artifact_id"]) is None:
+                issues.append(
+                    HealthIssue(
+                        code="BROKEN_RUN_ARTIFACT_REFERENCE",
+                        detail=f"run {ra['run_id']} recorded producing {ra['artifact_type']}/{ra['artifact_id']}, "
                         f"which is no longer in the artifact index",
                     )
                 )

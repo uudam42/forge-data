@@ -455,6 +455,27 @@ class CatalogRepository:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Run-table preservation check (v2.6, Design Requirement 57) --
+    # read-only row counts so CatalogService.rebuild() can assert these
+    # tables are untouched, mirroring the v2.5 governance-preservation
+    # pattern. app.runs.repository.RunRepository owns all actual
+    # read/write access to these tables; this is deliberately the only
+    # overlap, kept here so rebuild() doesn't need a second repository
+    # dependency just to verify four COUNT(*) queries.
+    # ------------------------------------------------------------------
+
+    def list_all_run_artifacts(self) -> list[dict]:
+        return [dict(r) for r in self._conn.execute("SELECT * FROM run_artifacts").fetchall()]
+
+    def count_run_tables(self) -> tuple[int, int, int, int]:
+        return (
+            self._conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0],
+            self._conn.execute("SELECT COUNT(*) FROM pipeline_stage_runs").fetchone()[0],
+            self._conn.execute("SELECT COUNT(*) FROM run_artifacts").fetchone()[0],
+            self._conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0],
+        )
+
+    # ------------------------------------------------------------------
     # Catalog metadata (build info, schema version)
     # ------------------------------------------------------------------
 

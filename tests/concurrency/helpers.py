@@ -308,3 +308,81 @@ def hold_selective_rebuild_lock_worker(data_root: str, old_type: str, old_id: st
         out_queue.put((type(exc).__name__, str(exc)))
     except Exception as exc:
         out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+# ---------------------------------------------------------------------------
+# v2.6 -- pipeline run concurrency workers
+# ---------------------------------------------------------------------------
+
+
+def _run_service_for(data_root: str, *, max_runs: int = 10):
+    from app.runs.repository import RunRepository
+    from app.runs.service import RunService
+
+    settings = settings_for(data_root)
+    settings = settings.model_copy(update={"MAX_LOCAL_PIPELINE_RUNS": max_runs})
+    conn = get_connection(settings.CATALOG_DB_PATH, busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS)
+    repo = RunRepository(conn, db_path=str(settings.CATALOG_DB_PATH), busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS)
+    return RunService(repo=repo, settings=settings)
+
+
+def _minimal_run_request():
+    from app.cleaning.models import CleaningConfig
+    from app.packaging.models import PackagingConfig
+    from app.qc.models import QCConfig
+    from app.runs.models import PipelineCleaningConfig, PipelinePackagingConfig, PipelineQCConfig, PipelineRunRequest, PipelineStreamConfig, PipelineTransformationConfig
+    from app.transformation.models import TransformationConfig
+
+    return PipelineRunRequest(
+        streams=[PipelineStreamConfig(sensor_type="imu")],
+        cleaning=PipelineCleaningConfig(policy_name="default_multimodal", config=CleaningConfig(required_streams=["imu"])),
+        transformation=PipelineTransformationConfig(profile_name="multimodal_window_v1", config=TransformationConfig(window={"mode": "count", "size": 10, "stride": 10, "drop_incomplete": True})),
+        qc=PipelineQCConfig(profile_name="default_dataset_qc", config=QCConfig(minimum_samples=1)),
+        packaging=PipelinePackagingConfig(profile_name="default_ml_package", config=PackagingConfig(split={"strategy": "group_hash", "train_ratio": 1.0, "validation_ratio": 0.0, "test_ratio": 0.0, "seed": 1}, grouping={"mode": "source_overlap"})),
+    )
+
+
+def create_run_worker(data_root: str, out_queue) -> None:
+    try:
+        service = _run_service_for(data_root, max_runs=10)
+        run_id = service.create_run(run_type="pipeline", request=_minimal_run_request())
+        out_queue.put(("ok", run_id))
+    except CatalogError as exc:
+        out_queue.put((type(exc).__name__, str(exc)))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+def poll_run_worker(data_root: str, run_id: str, out_queue) -> None:
+    try:
+        service = _run_service_for(data_root)
+        run = service.get_run(run_id)
+        out_queue.put(("ok", run.status))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+def cancel_run_worker(data_root: str, run_id: str, out_queue) -> None:
+    try:
+        service = _run_service_for(data_root)
+        result = service.request_cancel(run_id)
+        out_queue.put(("ok", result.status))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+def mark_running_and_completed_worker(data_root: str, run_id: str, out_queue) -> None:
+    """Simulates a run's full lifecycle from a real separate process --
+    used to build up real run history before a concurrent catalog
+    rebuild in the same test."""
+    try:
+        service = _run_service_for(data_root)
+        service.mark_running(run_id, executor_id=f"proc:{os.getpid()}")
+        with service._repo.transaction():  # noqa: SLF001 -- test-only direct stage bookkeeping
+            service._repo.create_stage_run(stage_run_id=f"stagerun_{run_id}", run_id=run_id, stage="ingestion:imu", status="pending")
+            service._repo.update_stage_run(f"stagerun_{run_id}", status="completed", records_processed=1)
+            service._repo.record_run_artifact(run_id=run_id, stage="ingestion:imu", artifact_type="ingestion", artifact_id=f"ing_{run_id}", created_at=_now())
+        service.mark_completed(run_id)
+        out_queue.put(("ok", "completed"))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))

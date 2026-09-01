@@ -174,6 +174,85 @@ CREATE TABLE IF NOT EXISTS dataset_version_governance_events (
 CREATE INDEX IF NOT EXISTS idx_gov_version_events
     ON dataset_version_governance_events(dataset_name, version, event_id);
 
+-- Pipeline runs (v2.6). Operational execution metadata -- NEVER the
+-- source of truth for artifact content (that stays filesystem manifests,
+-- per v2.1). A run may fail, be cancelled, or produce zero artifacts
+-- without that implying anything about artifacts already published.
+-- See docs/DETAILED_GUIDE.md "Pipeline runs and observability (v2.6)".
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id            TEXT PRIMARY KEY,
+    run_type          TEXT NOT NULL,   -- 'stage' | 'pipeline' | 'selective_rebuild'
+    status            TEXT NOT NULL,   -- queued|running|completed|failed|cancel_requested|cancelled
+    created_at        TEXT NOT NULL,
+    started_at        TEXT,
+    finished_at       TEXT,
+    current_stage     TEXT,
+    request_json      TEXT NOT NULL,   -- canonical JSON snapshot of the effective request -- never raw file bytes
+    config_hash       TEXT NOT NULL,
+    error_code        TEXT,
+    error_message     TEXT,
+    executor_id       TEXT,            -- hostname:pid:uuid of the process currently owning execution
+    last_heartbeat_at TEXT,
+    retry_of_run_id   TEXT             -- optional; a retry is always a NEW run_id, never a mutation of the old one
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_status ON pipeline_runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_created ON pipeline_runs(created_at);
+
+-- Deliberately NOT foreign-keyed to `artifacts` -- a run's own life
+-- (queued/running/...) is independent of whether any given artifact it
+-- touches happens to be currently indexed.
+CREATE TABLE IF NOT EXISTS pipeline_stage_runs (
+    stage_run_id       TEXT PRIMARY KEY,
+    run_id             TEXT NOT NULL,
+    stage              TEXT NOT NULL,
+    status             TEXT NOT NULL,  -- pending|running|completed|failed|skipped|cancelled
+    started_at         TEXT,
+    finished_at        TEXT,
+    records_total      INTEGER,
+    records_processed  INTEGER,
+    bytes_total        INTEGER,
+    bytes_processed    INTEGER,
+    artifacts_created  INTEGER NOT NULL DEFAULT 0,
+    error_code         TEXT,
+    error_message      TEXT,
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stage_runs_run ON pipeline_stage_runs(run_id);
+
+-- Operational provenance ("which run produced this"), NOT causal lineage
+-- -- app.catalog.graph's edges remain the sole source of truth for
+-- upstream/downstream relationships. Deliberately NOT foreign-keyed to
+-- `artifacts`: an artifact a run produced may not be scanned/indexed yet
+-- (catalog population stays scan-driven, per v2.1-v2.5), and must never
+-- have its run history silently dropped because of that.
+CREATE TABLE IF NOT EXISTS run_artifacts (
+    run_id         TEXT NOT NULL,
+    stage          TEXT NOT NULL,
+    artifact_type  TEXT NOT NULL,
+    artifact_id    TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (run_id, artifact_type, artifact_id),
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_artifacts_run ON run_artifacts(run_id);
+
+-- Append-only, meaningful lifecycle transitions only -- never one row
+-- per progress update (those live as mutable current-state columns on
+-- pipeline_stage_runs instead; see Design Requirement 21).
+CREATE TABLE IF NOT EXISTS run_events (
+    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    detail      TEXT,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, event_id);
+
 CREATE TABLE IF NOT EXISTS catalog_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

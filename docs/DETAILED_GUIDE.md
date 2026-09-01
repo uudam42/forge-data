@@ -30,6 +30,7 @@ v2.2    Large-scale Streaming + Resource Bounds (cross-cutting, not a stage) COM
 v2.3    Sensor / Schema Plugin System (cross-cutting, not a stage) COMPLETE
 v2.4    Multiprocess Concurrency + SQLite Safety (cross-cutting, not a stage) COMPLETE
 v2.5    Data Governance + Selective Rebuild (cross-cutting, not a stage) COMPLETE
+v2.6    Pipeline Runs, Progress, Cancellation + Observability (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -4120,6 +4121,328 @@ state, kept explicitly distinct from actual catalog integrity problems
 
 ---
 
+## Pipeline runs and observability (v2.6)
+
+Every prior milestone modeled **artifacts** (immutable persisted data),
+**lineage** (what produced what), **datasets** (named, versioned
+collections), and **governance** (is this artifact trustworthy). v2.6
+adds the piece none of those answer: **what actually happened during
+one execution?**
+
+### Run vs. Artifact
+
+**A run is ephemeral, operational execution state. An artifact is
+immutable persisted data output.** A run may fail, be cancelled,
+produce zero artifacts, or produce several; none of that touches
+artifact truth. Artifacts remain governed entirely by v2.1's atomic
+staging/commit — nothing in v2.6 ever writes a "running" marker into a
+manifest, and a run's own success or failure is tracked in completely
+separate SQLite tables (`pipeline_runs`, `pipeline_stage_runs`,
+`run_artifacts`, `run_events`) that a stage service never even knows
+exist.
+
+### PipelineRun state machine
+
+```
+queued ──────────────▶ running ──────────────▶ completed
+   │                       │                       ▲
+   │                       ├──────────────────────▶ failed
+   │                       │                       ▲
+   │                       ▼                       │
+   └──────────────▶ cancel_requested ───────────────┤
+                           │                        │
+                           └───────────────▶ cancelled
+```
+
+Six states, deliberately no more (no `paused`/`retrying`/`zombie`/
+`unknown`). `cancel_requested` can resolve to **any** of `cancelled`,
+`completed`, or `failed` — the race where work finishes (successfully
+or not) before a pending cancellation is ever observed is legal and
+never forced backward into `cancelled` (see "Cancellation race"
+below). A retry is always a **new** `run_id` (optionally
+`retry_of_run_id`-linked); there is no `completed → running` or
+`failed → running`.
+
+### StageRun state machine
+
+```
+pending ──▶ running ──▶ completed
+   │            ├─────▶ failed
+   │            └─────▶ cancelled
+   ├──────────────────▶ skipped
+   └──────────────────▶ cancelled
+```
+
+Every stage a run will ever touch gets its `pipeline_stage_runs` row
+created up front, in `pending`, the moment the run starts executing —
+not lazily as each stage is reached — so `stages_total` in the API is
+correct from the very first poll, not something that grows as the run
+progresses.
+
+### Run storage
+
+Four new tables in the same `catalog.db` v2.4/v2.5 already made
+multiprocess-safe (`app/runs/repository.py::RunRepository`, its own
+class, sharing the identical `BEGIN IMMEDIATE`/busy-timeout transaction
+machinery as `CatalogRepository`):
+
+- **`pipeline_runs`** — one row per run: identity, status, timestamps,
+  `current_stage`, the canonical config snapshot (`request_json` +
+  `config_hash`), structured error, `executor_id`/`last_heartbeat_at`.
+- **`pipeline_stage_runs`** — one row per stage attempt: status,
+  timestamps, `records_total`/`records_processed`,
+  `bytes_total`/`bytes_processed`, `artifacts_created`, structured error.
+- **`run_artifacts`** — operational provenance ("which run produced
+  this"), deliberately separate from causal lineage (`app.catalog.graph`'s
+  edges remain the only source of truth for upstream/downstream).
+- **`run_events`** — append-only, meaningful lifecycle transitions only
+  (`RUN_CREATED`, `RUN_STARTED`, `STAGE_*`, `CANCEL_REQUESTED`,
+  `RUN_CANCELLED`, `RUN_COMPLETED`, `RUN_FAILED`) — never one row per
+  progress update; frequent progress lives as mutable columns on
+  `pipeline_stage_runs` instead.
+
+Neither `run_artifacts` nor `pipeline_stage_runs`/`pipeline_runs` are
+foreign-keyed to `artifacts` — an artifact a run produced may not be
+scanned/indexed yet (catalog population stays scan-driven, exactly as
+established in v2.1–v2.5), and that must never silently drop run
+history.
+
+### Pipeline executor architecture
+
+`app/runs/executor.py::PipelineRunner` orchestrates the **existing**
+stage services directly — `IngestionService`, `ValidationService`,
+`IntegrityService`, `NormalizationService`, `SynchronizationService`,
+`CleaningService`, `TransformationService`, `QCService`,
+`PackagingService` — constructed exactly the way each route's own
+`get_X_service` dependency already does. No HTTP round-trip, no
+duplicated stage logic (the same principle v2.5's
+`SelectiveRebuildExecutor` already established).
+
+Per-stream sensor identity (schema name/version, normalization profile
+name/version) is resolved from the **v2.3 `SensorPluginRegistry`** by
+`sensor_type` — `app/runs/models.py`'s `PipelineStreamConfig` only ever
+carries `sensor_type` + `source_units`, never a hardcoded modality name.
+
+**Workflow**: for each stream, ingestion → validation → integrity →
+normalization runs to completion; once every stream's normalization has
+completed, all normalized streams feed one downstream branch:
+synchronization → cleaning → transformation → QC → packaging. All
+streams in one run share **one** `session_id` (generated once if the
+caller didn't supply one) — an early version of this executor left
+`session_id` unset per stream, and every multi-stream run failed at
+synchronization because each stream landed in its own random session; a
+real bug caught in development, now regression-tested.
+
+### Pipeline request/config model
+
+`PipelineRunRequest` (`app/runs/models.py`) reuses each downstream
+stage's **own** config models directly — `ReferenceConfig`/
+`AlignmentConfig`/`ClockCorrectionConfig` from synchronization,
+`CleaningConfig`, `TransformationConfig`, `QCConfig`, `PackagingConfig`
+— rather than inventing a second, parallel config schema. `POST
+/api/v1/runs` accepts this as a JSON string in a `config` multipart
+form field, with one raw data file per stream (matched by list order)
+as separate file uploads — file bytes are written to a temporary file
+synchronously in the request handler and never enter run metadata at
+all (only paths/identifiers/config JSON do).
+
+### Progress reporting and throttling
+
+`app/runs/progress.py::ProgressReporter` is a small interface
+(`start_stage`/`update`/`complete_stage`/`fail_stage`/`skip_stage`/
+`cancel_stage`). The default, `NoOpProgressReporter`, is what every
+legacy, non-run-aware stage call effectively uses — zero SQLite
+overhead for existing single-stage API users, unaffected by any of this.
+Run-aware execution uses `DatabaseProgressReporter`, which accumulates
+`update()` deltas in memory and only flushes a real UPDATE when
+`PROGRESS_UPDATE_INTERVAL_MS` (500ms default) has elapsed by
+`time.monotonic()` — never wall-clock time, which can jump and would
+make throttling unreliable.
+
+**Granularity, honestly stated**: progress and cancellation in v2.6 are
+recorded and checked at **stage boundaries**, not inside any stage's own
+per-record loop. Reaching into, say, validation's row loop would mean
+modifying the separate `Validator` implementations it delegates to
+(CSV/JSONL/JSON-array), which conflicts directly with "reuse existing
+services, don't duplicate/rewrite stage logic." A cancellation request
+is therefore observed within, at most, the duration of whichever single
+stage is currently in flight — never mid-stage, but also never as slow
+as waiting for the whole run. Measured directly: a 200,000-record,
+13-stage run issues **39 progress-related SQLite UPDATEs total** (see
+"Write amplification" below) — completely independent of record count,
+because progress is recorded per stage, not per record.
+
+### Cancellation
+
+`app/runs/cancellation.py::CancellationToken.check()` is cooperative —
+it raises a plain `RunCancellationRequested` exception the executor
+catches to unwind cleanly, never SIGKILL (SIGKILL remains crash-recovery
+territory; see "Process crash" below). It's cheap to call often because
+it only actually re-reads the run's status from SQLite at most once per
+`poll_interval_s` (same monotonic-clock throttling as progress); every
+call in between is an in-memory boolean check.
+
+**A real bug caught live** (against a genuine uvicorn server, not just
+unit tests): an earlier version of the stage-boundary code
+unconditionally set the run's status back to `running` at the very top
+of every stage, *before* checking for cancellation — which silently
+overwrote a real `cancel_requested` status back to `running` on every
+single boundary, so a cancellation could never actually take effect
+under normal operation. The fix: check cancellation **first**, and only
+update status to `running` afterward if not cancelled. Both this bug and
+a related one (the stage where cancellation is first observed must
+itself become `cancelled`, not stay `pending` forever) are now pinned by
+regression tests using a *real* `CancellationToken` against real DB
+state, not a mock — the mock-based version of the test had passed
+despite the bug still being present.
+
+**Cancellation race** (Design Requirement 40): if the run finishes (or
+fails) before a pending `cancel_requested` is ever observed at a stage
+boundary, `completed`/`failed` is the correct, legal final state —
+cancellation never retroactively undoes successfully committed work.
+
+### Failure semantics
+
+If stage *N* fails: stage *N* becomes `failed` (with a structured error
+— see below), every remaining stage becomes `skipped`, the run becomes
+`failed`, and every artifact from stages *before* N remains exactly as
+valid as it was — no rollback of prior successful stages is ever
+attempted (that's what v2.1's own atomic-artifact and immutability
+guarantees already make unnecessary).
+
+### Structured errors
+
+`app/runs/error_adapter.py::normalize_stage_error` classifies a raised
+exception by **which Python package it lives in**, not by hand-maintained
+per-stage exception lists (fragile, and silently incomplete — several
+stages define "not found" exceptions in a `registry.py` that doesn't
+inherit that stage's own `service.py` error base, e.g.
+`CleaningPolicyNotFoundError`). Any exception whose class lives anywhere
+under `app.<stage>.*` is reported using its own class name as the code
+(e.g. `CleaningPolicyNotFoundError`, `IntegrityNotPassedError`) with its
+real message; anything from outside that package becomes
+`INTERNAL_STAGE_ERROR` with a safe, generic message (the real exception
+type is still recorded in `details` and the full traceback still goes to
+logs via `logger.exception()`). Governance-gate rejections
+(`ArtifactInvalidError`, `UpstreamArtifactInvalidError`, ...) are
+special-cased to their own v2.5 codes directly.
+
+### Process crash and heartbeat recovery
+
+A running executor updates `last_heartbeat_at` at every stage boundary.
+`app/runs/recovery.py::RunRecoveryService.reconcile()` runs once at
+application startup (`app/main.py`'s startup event): any run still
+`running`/`cancel_requested` whose heartbeat is older than
+`RUN_STALE_HEARTBEAT_SECONDS` (30s default) is marked `failed` with
+`RUN_PROCESS_LOST` — re-checked inside the same transaction against a
+fresh read, so a process that's merely slow (not dead) is never
+wrongly declared lost by a race between the staleness scan and its next
+real heartbeat. This is deliberately **not** PID-based liveness (a PID
+can be reused by an unrelated process after the original exits, making
+a naive "is this PID alive" check both a false negative and, worse, a
+false positive). There is no automatic resume — the user starts a new
+run. v2.1's own staging/recovery machinery independently guarantees no
+partial artifact ever became visible regardless of when the crash
+happened.
+
+### Run-to-artifact relationship
+
+`run_artifacts` records which artifacts each run produced — purely
+operational provenance, never a substitute for causal lineage. A
+legacy artifact discovered by a catalog scan with no run behind it at
+all is completely valid (v1.0–v2.5 artifacts predate this table
+entirely); a run producing zero artifacts (failing at its very first
+stage) is equally valid.
+
+### Selective rebuild integration
+
+`POST /api/v1/rebuild/execute` (v2.5) is completely unmodified — after
+it returns its already-complete result,
+`RunService.record_selective_rebuild_run()` wraps that result into a
+`run_type="selective_rebuild"` `PipelineRun` plus one `StageRun` per
+rebuild step, purely post-hoc (the rebuild already finished by the time
+this runs, unlike `run_type="pipeline"`, which executes in the
+background). Recording the run is wrapped so a failure to record it
+never fails the underlying rebuild response — run observability is
+strictly additive telemetry over an operation that has already
+succeeded or failed on its own terms.
+
+### Catalog rebuild preservation
+
+`CatalogService.rebuild()` asserts all four run tables' row counts are
+identical before and after, exactly mirroring the v2.5
+governance-preservation pattern — `clear_artifact_index()` never
+references any of them. A `run_artifacts` row whose artifact vanished
+from the index (e.g. its manifest disappeared from disk) is surfaced as
+a `BROKEN_RUN_ARTIFACT_REFERENCE` catalog-health issue, never silently
+deleted — a run failing or being cancelled is never itself a health
+issue (that's an intentional, valid outcome, the same principle v2.5
+established for an artifact being marked invalid).
+
+### Concurrency model
+
+Run creation's local-capacity check and insert happen inside one
+`BEGIN IMMEDIATE` transaction (the same read-decide-write-is-safe
+argument v2.4/v2.5 already established), so two processes racing to
+create a run never both slip past
+`MAX_LOCAL_PIPELINE_RUNS`. `queued` counts toward capacity, not just
+`running` — in this design a queued run starts executing immediately
+(no real waiting queue), so treating it as reserved capacity from the
+moment it's created is what actually closes that race. Every run-state
+transition is its own short transaction, so updating one run never
+blocks unrelated work for long, exactly like every other v2.4-era write
+in this catalog.
+
+### Local execution — explicit limitation
+
+`POST /api/v1/runs` returns promptly (`run_id`, status `queued`) and
+executes via a plain FastAPI `BackgroundTasks` call in the same
+process — `app/runs/local_executor.py::LocalRunExecutor` is the entire
+local execution mechanism: no worker pool, no priority queue, no retry
+queue, no persistent daemon. **Run ownership is process-local: if the
+accepting process crashes, the run fails (see "Process crash" above) —
+there is no automatic handoff to another process, and a "queued" run
+row is durable metadata, not a durable job someone else can pick up.**
+This is a deliberate, documented boundary, not an oversight — the same
+category of limitation v2.4 already stated for the catalog itself
+("multiprocess-safe, not a distributed job queue").
+
+### Write amplification (measured)
+
+`tests/load/test_load_v26_run_progress.py` runs a real 200,000-record,
+two-stream (IMU+GPS), 13-stage pipeline through the run-aware API and
+counts every real `RunRepository.update_stage_run` UPDATE issued:
+**200,000 records processed via 39 progress DB UPDATEs across 13
+stages** — roughly 3 per stage (start, an optional `records_total`
+backfill, complete), completely independent of record count, confirming
+progress observability adds negligible database overhead at scale.
+
+### API endpoints
+
+```
+POST   /api/v1/runs                 create + start a run (multipart: config + files)
+GET    /api/v1/runs                 list runs (status/run_type filters, limit/offset)
+GET    /api/v1/runs/{run_id}        full detail: status, stages, progress, artifacts, error
+GET    /api/v1/runs/{run_id}/events append-only lifecycle event log
+POST   /api/v1/runs/{run_id}/cancel idempotent; sets cancel_requested if queued/running
+```
+
+### Limitations
+
+- Progress/cancellation granularity is per-stage, not per-record (see
+  "Progress reporting and throttling" above) — a deliberate, documented
+  trade-off against rewriting per-stage validator/writer internals.
+- No durable job queue: a run belongs to the process that started it;
+  that process crashing fails the run (see "Local execution" above).
+- No automatic retry, no resume-from-checkpoint — a retry is always an
+  explicit new run.
+- No distributed workers, cloud execution, remote queues,
+  cross-machine scheduling, autoscaling, DAG scheduler, cron scheduler,
+  web dashboard, RBAC, authentication, multi-tenancy, or CLI
+  productization — all explicitly out of scope for this milestone.
+
+---
+
 ## Setup
 
 ```bash
@@ -4226,6 +4549,10 @@ Environment variables (all optional, sensible defaults provided):
 | `CATALOG_BUSY_TIMEOUT_MS`   | `5000`               | How long a catalog write waits for another process's write lock before a structured `CatalogBusyError` (v2.4) |
 | `CATALOG_JOURNAL_MODE`      | `WAL`                | SQLite journal mode, verified (not assumed) at connection time (v2.4) |
 | `CATALOG_REBUILD_LOCK_TIMEOUT_MS` | `0`            | `0` = fail immediately if another process holds the rebuild lock; a positive value waits up to that long instead (v2.4) |
+| `RUN_STALE_HEARTBEAT_SECONDS` | `30.0`           | A `running`/`cancel_requested` run whose heartbeat is older than this is marked `failed` with `RUN_PROCESS_LOST` at startup (v2.6) |
+| `RUN_HEARTBEAT_INTERVAL_SECONDS` | `2.0`         | How often a running pipeline refreshes its heartbeat and re-checks for a cancellation request (v2.6) |
+| `PROGRESS_UPDATE_INTERVAL_MS` | `500.0`          | Minimum wall-clock time between real progress SQLite writes for one stage, regardless of how often progress is reported (v2.6) |
+| `MAX_LOCAL_PIPELINE_RUNS`   | `2`                  | How many pipeline/selective-rebuild runs may be `queued`/`running`/`cancel_requested` at once, across every process sharing this workspace (v2.6) |
 
 ## How raw storage works
 
@@ -4358,6 +4685,30 @@ selective-rebuild lock is a real cross-process OS lock. See "Data
 governance and selective rebuild (v2.5)" above for the design each test
 proves, and `tests/v25_helpers.py` for the shared real-pipeline-via-HTTP
 builder these tests share.
+
+v2.6 adds 35 more tests to the default suite (1101 total):
+`test_v26_run_state_machine.py` (12 — transitions, config-hash
+determinism, not-found), `test_v26_capacity.py` (4 — local capacity
+enforced/released after completion/failure/cancellation),
+`test_v26_crash_recovery.py` (5 — stale-heartbeat reconciliation, fresh
+heartbeat left alone, idempotent reconcile, finished runs never
+touched), `test_v26_catalog_rebuild_preserves_runs.py` (2),
+`test_v26_pipeline_execution.py` (3 — IMU+GPS, IMU+GPS+Force/Torque,
+and a byte-identical-output comparison against the legacy stage-by-stage
+API), `test_v26_failure.py` (2 — cascading skip on stage failure, config
+rejected before any stage runs), `test_v26_cancellation.py` (5,
+including two real regression tests for bugs caught live — see
+"Cancellation" above), and
+`test_v26_governance_and_rebuild_integration.py` (2 — the executor's own
+governance gate, and a selective rebuild's observable run record). Plus
+4 more **opt-in** `tests/concurrency/` tests (26 total) in
+`test_v26_runs_concurrency.py` — concurrent run creation/polling/cancel
+from separate real processes, and catalog rebuild alongside real run
+history — and one more **opt-in** `tests/load/` test (15 total) in
+`test_load_v26_run_progress.py`, the write-amplification measurement.
+See "Pipeline runs and observability (v2.6)" above for the design each
+test proves, and `tests/v26_helpers.py` for the shared run-submission
+helper.
 
 ## Deliberate MVP limitations
 
@@ -4749,10 +5100,26 @@ dataset version remain fully intact. Verified end-to-end with a
 flagship bad-normalization-to-corrected-dataset-version scenario, a
 real fault-injected crash mid-rebuild, and a live `uvicorn` + `curl`
 demo covering the full workflow plus a genuine `SIGKILL` during a live
-`/rebuild/execute` call.
+`/rebuild/execute` call. v2.6 (Pipeline Runs, Progress, Cancellation &
+Observability) adds a first-class `PipelineRun`/`StageRun` execution
+model: a multi-stream (IMU+GPS+Force/Torque) pipeline runs through one
+durable, pollable run; progress and cooperative cancellation are
+checked/recorded at stage boundaries with SQLite writes throttled by
+wall-clock time (39 progress UPDATEs measured for a real 200,000-record
+run); a stale heartbeat after a process crash is reconciled to a
+structured `RUN_PROCESS_LOST` failure at startup; and a v2.5 selective
+rebuild execution gets its own observable `run_type="selective_rebuild"`
+record. Verified live against a real uvicorn server: a successful
+IMU+GPS+Force/Torque run, a real stage failure with correct cascading
+skip, a genuine mid-flight cancellation (including a real bug caught
+live — a cancellation status was being silently overwritten before it
+could take effect — fixed and regression-tested), a real `SIGKILL`
+mid-run followed by clean startup reconciliation, and a selective
+rebuild's run record.
 
-1066 tests in the default suite, plus an opt-in `tests/load/` suite (14
+1101 tests in the default suite, plus an opt-in `tests/load/` suite (15
 tests, `pytest -m load`) exercising real memory measurement at up to
-1,000,000-row scale, plus an opt-in `tests/concurrency/` suite (22
-tests, `pytest -m concurrency`) exercising real multiprocess contention.
-No Step 11 work has been started or planned as part of this build.
+1,000,000-row scale plus the v2.6 write-amplification measurement, plus
+an opt-in `tests/concurrency/` suite (26 tests, `pytest -m concurrency`)
+exercising real multiprocess contention. No Step 11 work has been
+started or planned as part of this build.

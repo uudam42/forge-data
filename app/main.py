@@ -15,6 +15,7 @@ from app.api.routes.packaging import router as packaging_router
 from app.api.routes.qc import router as qc_router
 from app.api.routes.rebuild import router as rebuild_router
 from app.api.routes.recovery import router as recovery_router
+from app.api.routes.runs import router as runs_router
 from app.api.routes.sensors import router as sensors_router
 from app.api.routes.synchronization import router as synchronization_router
 from app.api.routes.transformation import router as transformation_router
@@ -22,6 +23,9 @@ from app.api.routes.validation import router as validation_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.ingestion.models import HealthResponse
+from app.runs.recovery import RunRecoveryService
+from app.runs.repository import RunRepository
+from app.storage.catalog_store import get_connection
 
 settings = get_settings()
 configure_logging(settings.LOG_LEVEL)
@@ -57,6 +61,34 @@ app.include_router(datasets_router)
 app.include_router(recovery_router)
 app.include_router(sensors_router)
 app.include_router(rebuild_router)
+app.include_router(runs_router)
+
+
+@app.on_event("startup")
+def _reconcile_stale_runs() -> None:
+    """v2.6 Design Requirement 34: any run left `running`/
+    `cancel_requested` from a process that crashed before this restart is
+    marked `failed` with RUN_PROCESS_LOST here, once, at startup --
+    never automatically resumed or retried.
+
+    Resolves settings via `app.dependency_overrides` (falling back to the
+    real cached `get_settings()`) rather than closing over the module-level
+    `settings` bound at import time. `@app.on_event("startup")` does not
+    support `Depends()` injection, but `TestClient(app)` used as a context
+    manager -- the established pattern in every test's `client` fixture --
+    does fire this handler, so without this it would silently ignore each
+    test's `app.dependency_overrides[get_settings]` override and touch the
+    real project `data/catalog/catalog.db` on every such test.
+    """
+    current_settings = app.dependency_overrides.get(get_settings, get_settings)()
+    conn = get_connection(current_settings.CATALOG_DB_PATH, busy_timeout_ms=current_settings.CATALOG_BUSY_TIMEOUT_MS, journal_mode=current_settings.CATALOG_JOURNAL_MODE)
+    repo = RunRepository(conn, db_path=str(current_settings.CATALOG_DB_PATH), busy_timeout_ms=current_settings.CATALOG_BUSY_TIMEOUT_MS)
+    reconciled = RunRecoveryService(repo=repo, stale_after_seconds=current_settings.RUN_STALE_HEARTBEAT_SECONDS).reconcile()
+    if reconciled:
+        import logging
+
+        logging.getLogger("app.runs.recovery").warning("STARTUP_RUN_RECONCILIATION reconciled=%d", reconciled)
+    conn.close()
 
 
 @app.get("/health", response_model=HealthResponse)
