@@ -37,6 +37,19 @@ class CatalogErrorCode(str, Enum):
     CATALOG_BUSY = "CATALOG_BUSY"
     CATALOG_REBUILD_IN_PROGRESS = "CATALOG_REBUILD_IN_PROGRESS"
     CATALOG_LOCK_FAILED = "CATALOG_LOCK_FAILED"
+    # v2.5 — data governance and selective rebuild
+    ARTIFACT_INVALID = "ARTIFACT_INVALID"
+    ARTIFACT_DEPRECATED = "ARTIFACT_DEPRECATED"
+    UPSTREAM_ARTIFACT_INVALID = "UPSTREAM_ARTIFACT_INVALID"
+    UPSTREAM_ARTIFACT_DEPRECATED = "UPSTREAM_ARTIFACT_DEPRECATED"
+    GOVERNANCE_TARGET_NOT_FOUND = "GOVERNANCE_TARGET_NOT_FOUND"
+    INVALID_GOVERNANCE_TRANSITION = "INVALID_GOVERNANCE_TRANSITION"
+    GOVERNANCE_REASON_REQUIRED = "GOVERNANCE_REASON_REQUIRED"
+    REBUILD_REPLACEMENT_INCOMPATIBLE = "REBUILD_REPLACEMENT_INCOMPATIBLE"
+    REBUILD_CONFIG_UNAVAILABLE = "REBUILD_CONFIG_UNAVAILABLE"
+    REBUILD_PLAN_STALE = "REBUILD_PLAN_STALE"
+    REBUILD_PLAN_NOT_FOUND = "REBUILD_PLAN_NOT_FOUND"
+    SELECTIVE_REBUILD_IN_PROGRESS = "SELECTIVE_REBUILD_IN_PROGRESS"
 
 
 class CatalogError(Exception):
@@ -166,3 +179,215 @@ class CatalogLockFailedError(CatalogError):
 
     def to_dict(self) -> dict:
         return {"code": CatalogErrorCode.CATALOG_LOCK_FAILED.value, "lock_path": self.lock_path, "reason": self.reason}
+
+
+# ---------------------------------------------------------------------------
+# v2.5 — data governance and selective rebuild
+# ---------------------------------------------------------------------------
+
+
+class GovernanceTargetNotFoundError(CatalogError):
+    """The artifact/dataset-version a governance operation targets isn't
+    in the catalog at all (never scanned, or a typo) -- distinct from
+    "artifact exists but is active" (no governance row)."""
+
+
+class InvalidGovernanceTransitionError(CatalogError):
+    """The requested state transition isn't in the allowed set (see
+    app.catalog.governance.ALLOWED_TRANSITIONS) -- e.g. there is no
+    transition into a state that isn't active/deprecated/invalid."""
+
+
+class GovernanceReasonRequiredError(CatalogError):
+    """deprecate/invalidate/reactivate all require a non-empty reason --
+    this is what makes the audit trail answer "why", not just "what"."""
+
+
+class ArtifactInvalidError(CatalogError):
+    """The DIRECT artifact this request targets is itself marked invalid.
+    Distinct from UpstreamArtifactInvalidError, which is about an
+    ancestor further up the chain."""
+
+    def __init__(self, *, artifact_type: str, artifact_id: str, reason: str) -> None:
+        self.artifact_type = artifact_type
+        self.artifact_id = artifact_id
+        self.reason = reason
+        super().__init__(f"{artifact_type}/{artifact_id} is marked invalid: {reason}")
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.ARTIFACT_INVALID.value,
+            "artifact_type": self.artifact_type,
+            "artifact_id": self.artifact_id,
+            "reason": self.reason,
+        }
+
+
+class ArtifactDeprecatedError(CatalogError):
+    """The direct artifact is deprecated and the caller did not pass
+    allow_deprecated=true. Never raised for invalid artifacts (those
+    always raise ArtifactInvalidError / UpstreamArtifactInvalidError,
+    which have no override)."""
+
+    def __init__(self, *, artifact_type: str, artifact_id: str, reason: str) -> None:
+        self.artifact_type = artifact_type
+        self.artifact_id = artifact_id
+        self.reason = reason
+        super().__init__(
+            f"{artifact_type}/{artifact_id} is deprecated: {reason} "
+            f"(pass allow_deprecated=true to use it for new downstream work anyway)"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.ARTIFACT_DEPRECATED.value,
+            "artifact_type": self.artifact_type,
+            "artifact_id": self.artifact_id,
+            "reason": self.reason,
+        }
+
+
+class UpstreamArtifactInvalidError(CatalogError):
+    """A direct input artifact is itself active, but one of ITS ancestors
+    is marked invalid -- see Design Requirement 8's governance-chain
+    check. There is no override for this; an invalid ancestor always
+    blocks new downstream work through it."""
+
+    def __init__(self, *, artifact_type: str, artifact_id: str, invalid_ancestor_type: str, invalid_ancestor_id: str, reason: str) -> None:
+        self.artifact_type = artifact_type
+        self.artifact_id = artifact_id
+        self.invalid_ancestor_type = invalid_ancestor_type
+        self.invalid_ancestor_id = invalid_ancestor_id
+        self.reason = reason
+        super().__init__(
+            f"{artifact_type}/{artifact_id} has an invalid ancestor "
+            f"{invalid_ancestor_type}/{invalid_ancestor_id}: {reason}"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.UPSTREAM_ARTIFACT_INVALID.value,
+            "artifact_type": self.artifact_type,
+            "artifact_id": self.artifact_id,
+            "invalid_ancestor_type": self.invalid_ancestor_type,
+            "invalid_ancestor_id": self.invalid_ancestor_id,
+            "reason": self.reason,
+        }
+
+
+class UpstreamArtifactDeprecatedError(CatalogError):
+    """A direct input artifact is active, but one of its ancestors is
+    deprecated, and the caller did not pass allow_deprecated=true."""
+
+    def __init__(self, *, artifact_type: str, artifact_id: str, deprecated_ancestor_type: str, deprecated_ancestor_id: str, reason: str) -> None:
+        self.artifact_type = artifact_type
+        self.artifact_id = artifact_id
+        self.deprecated_ancestor_type = deprecated_ancestor_type
+        self.deprecated_ancestor_id = deprecated_ancestor_id
+        self.reason = reason
+        super().__init__(
+            f"{artifact_type}/{artifact_id} has a deprecated ancestor "
+            f"{deprecated_ancestor_type}/{deprecated_ancestor_id}: {reason} "
+            f"(pass allow_deprecated=true to use it for new downstream work anyway)"
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.UPSTREAM_ARTIFACT_DEPRECATED.value,
+            "artifact_type": self.artifact_type,
+            "artifact_id": self.artifact_id,
+            "deprecated_ancestor_type": self.deprecated_ancestor_type,
+            "deprecated_ancestor_id": self.deprecated_ancestor_id,
+            "reason": self.reason,
+        }
+
+
+class RebuildReplacementIncompatibleError(CatalogError):
+    """The proposed (old, new) replacement pair fails a compatibility
+    check -- different artifact_type, different upstream scope, or an
+    otherwise nonsensical substitution (e.g. a GPS normalization
+    replacing an IMU normalization)."""
+
+    def __init__(self, *, old_type: str, old_id: str, new_type: str, new_id: str, reason: str) -> None:
+        self.old_type = old_type
+        self.old_id = old_id
+        self.new_type = new_type
+        self.new_id = new_id
+        self.reason = reason
+        super().__init__(f"{new_type}/{new_id} cannot replace {old_type}/{old_id}: {reason}")
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.REBUILD_REPLACEMENT_INCOMPATIBLE.value,
+            "old_type": self.old_type,
+            "old_id": self.old_id,
+            "new_type": self.new_type,
+            "new_id": self.new_id,
+            "reason": self.reason,
+        }
+
+
+class RebuildConfigUnavailableError(CatalogError):
+    """Raised only by the EXECUTOR (never the planner, which reports this
+    honestly as a plan-step flag instead) if execution is attempted for a
+    manual_configuration_required step without an explicit config
+    override supplied."""
+
+    def __init__(self, *, artifact_type: str, artifact_id: str, reason: str) -> None:
+        self.artifact_type = artifact_type
+        self.artifact_id = artifact_id
+        self.reason = reason
+        super().__init__(f"Cannot auto-execute rebuild of {artifact_type}/{artifact_id}: {reason}")
+
+    def to_dict(self) -> dict:
+        return {
+            "code": CatalogErrorCode.REBUILD_CONFIG_UNAVAILABLE.value,
+            "artifact_type": self.artifact_type,
+            "artifact_id": self.artifact_id,
+            "reason": self.reason,
+        }
+
+
+class RebuildPlanStaleError(CatalogError):
+    """The catalog changed materially between plan and execute (the
+    fingerprint no longer matches) -- reject and require a fresh plan
+    rather than executing against a description of the DAG that's no
+    longer accurate."""
+
+    def __init__(self, *, plan_id: str) -> None:
+        self.plan_id = plan_id
+        super().__init__(f"Rebuild plan {plan_id} is stale (the catalog changed since it was built) — request a new plan")
+
+    def to_dict(self) -> dict:
+        return {"code": CatalogErrorCode.REBUILD_PLAN_STALE.value, "plan_id": self.plan_id}
+
+
+class RebuildPlanNotFoundError(CatalogError):
+    """No plan with this plan_id is known to this process. Plans are
+    held in-memory only (see Design Requirement 18 — no background
+    queue, no persistence) -- a plan built by a different process, or
+    before a restart, cannot be executed elsewhere."""
+
+    def __init__(self, *, plan_id: str) -> None:
+        self.plan_id = plan_id
+        super().__init__(f"No rebuild plan found with id {plan_id!r}")
+
+    def to_dict(self) -> dict:
+        return {"code": CatalogErrorCode.REBUILD_PLAN_NOT_FOUND.value, "plan_id": self.plan_id}
+
+
+class SelectiveRebuildInProgressError(CatalogError):
+    """Another rebuild is already running for the same replacement root
+    -- distinct from CatalogRebuildInProgressError (the catalog-wide
+    filesystem-reconciliation rebuild from v2.4). Guards against
+    accidentally duplicating expensive selective-rebuild work, not
+    against arbitrary concurrent catalog writes (which v2.4 already
+    handles)."""
+
+    def __init__(self, *, old_type: str, old_id: str) -> None:
+        self.old_type = old_type
+        self.old_id = old_id
+        super().__init__(f"A selective rebuild rooted at {old_type}/{old_id} is already in progress")
+
+    def to_dict(self) -> dict:
+        return {"code": CatalogErrorCode.SELECTIVE_REBUILD_IN_PROGRESS.value, "old_type": self.old_type, "old_id": self.old_id}

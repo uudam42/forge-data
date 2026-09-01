@@ -18,6 +18,10 @@ Status codes:
   (CATALOG_LOCK_FAILED)
 - 503: the catalog was too busy to acquire a write lock within the
   configured timeout (CATALOG_BUSY) — transient, safe to retry
+
+Governance (v2.5) additional status codes:
+- 404: the artifact isn't in the catalog at all (GOVERNANCE_TARGET_NOT_FOUND)
+- 422: a nonsensical state transition, or a missing/empty reason
 """
 
 from __future__ import annotations
@@ -31,7 +35,17 @@ from app.catalog.errors import (
     CatalogRebuildFailedError,
     CatalogRebuildInProgressError,
     CatalogScanFailedError,
+    GovernanceReasonRequiredError,
+    GovernanceTargetNotFoundError,
     InvalidArtifactTypeError,
+    InvalidGovernanceTransitionError,
+)
+from app.catalog.governance_models import (
+    ArtifactGovernanceHistoryResponse,
+    ArtifactGovernanceResponse,
+    EnrichedImpactResponse,
+    GovernanceActionRequest,
+    GovernanceChainResponse,
 )
 from app.catalog.models import ArtifactDetail, ArtifactSummary, CatalogHealth, RebuildResult, ScanResult, VerificationResponse
 from app.catalog.rebuild_lock import RebuildLock
@@ -58,7 +72,7 @@ def get_catalog_service(settings: Settings = Depends(get_settings)) -> CatalogSe
     verifier = ArtifactVerifier(settings)
     lock_path = settings.CATALOG_DB_PATH.parent / "catalog.rebuild.lock"
     rebuild_lock = RebuildLock(lock_path)
-    return CatalogService(repo=repo, scanner=scanner, verifier=verifier, rebuild_lock=rebuild_lock)
+    return CatalogService(repo=repo, scanner=scanner, verifier=verifier, rebuild_lock=rebuild_lock, settings=settings)
 
 
 def raise_busy(exc: CatalogBusyError):
@@ -134,3 +148,114 @@ async def verify_artifact(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ArtifactNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Data governance (v2.5)
+# ---------------------------------------------------------------------------
+
+
+def _governance_error_map(exc: Exception):
+    if isinstance(exc, InvalidArtifactTypeError):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if isinstance(exc, (ArtifactNotFoundError, GovernanceTargetNotFoundError)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if isinstance(exc, (InvalidGovernanceTransitionError, GovernanceReasonRequiredError)):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if isinstance(exc, CatalogBusyError):
+        raise_busy(exc)
+    raise exc
+
+
+@router.get(
+    "/artifacts/{artifact_type}/{artifact_id}/governance",
+    response_model=ArtifactGovernanceResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_artifact_governance(
+    artifact_type: str, artifact_id: str, service: CatalogService = Depends(get_catalog_service)
+) -> ArtifactGovernanceResponse:
+    try:
+        return service.get_artifact_governance(artifact_type, artifact_id)
+    except Exception as exc:
+        _governance_error_map(exc)
+
+
+@router.get(
+    "/artifacts/{artifact_type}/{artifact_id}/governance/history",
+    response_model=ArtifactGovernanceHistoryResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_artifact_governance_history(
+    artifact_type: str, artifact_id: str, service: CatalogService = Depends(get_catalog_service)
+) -> ArtifactGovernanceHistoryResponse:
+    try:
+        return service.get_artifact_governance_history(artifact_type, artifact_id)
+    except Exception as exc:
+        _governance_error_map(exc)
+
+
+@router.get(
+    "/artifacts/{artifact_type}/{artifact_id}/governance/chain",
+    response_model=GovernanceChainResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_governance_chain(
+    artifact_type: str, artifact_id: str, service: CatalogService = Depends(get_catalog_service)
+) -> GovernanceChainResponse:
+    """Design Requirement 8: the direct state plus every invalid/deprecated
+    ancestor found by walking the FULL upstream lineage, not just the
+    direct parent."""
+    try:
+        return service.get_governance_chain(artifact_type, artifact_id)
+    except Exception as exc:
+        _governance_error_map(exc)
+
+
+def _set_governance(
+    artifact_type: str, artifact_id: str, *, new_state: str, request: GovernanceActionRequest, service: CatalogService
+) -> ArtifactGovernanceResponse:
+    try:
+        return service.set_artifact_governance(
+            artifact_type, artifact_id, new_state=new_state, reason=request.reason, actor=request.actor,
+            superseded_by_type=request.superseded_by_type, superseded_by_id=request.superseded_by_id,
+        )
+    except Exception as exc:
+        _governance_error_map(exc)
+
+
+@router.post(
+    "/artifacts/{artifact_type}/{artifact_id}/deprecate",
+    response_model=ArtifactGovernanceResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def deprecate_artifact(
+    artifact_type: str, artifact_id: str, request: GovernanceActionRequest, service: CatalogService = Depends(get_catalog_service)
+) -> ArtifactGovernanceResponse:
+    return _set_governance(artifact_type, artifact_id, new_state="deprecated", request=request, service=service)
+
+
+@router.post(
+    "/artifacts/{artifact_type}/{artifact_id}/invalidate",
+    response_model=ArtifactGovernanceResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def invalidate_artifact(
+    artifact_type: str, artifact_id: str, request: GovernanceActionRequest, service: CatalogService = Depends(get_catalog_service)
+) -> ArtifactGovernanceResponse:
+    return _set_governance(artifact_type, artifact_id, new_state="invalid", request=request, service=service)
+
+
+@router.post(
+    "/artifacts/{artifact_type}/{artifact_id}/reactivate",
+    response_model=ArtifactGovernanceResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def reactivate_artifact(
+    artifact_type: str, artifact_id: str, request: GovernanceActionRequest, service: CatalogService = Depends(get_catalog_service)
+) -> ArtifactGovernanceResponse:
+    """Design Requirement 32: reactivation is a new event, never an
+    erasure of the invalidation/deprecation event that preceded it --
+    still requires an explicit reason (e.g. "investigation cleared
+    artifact")."""
+    return _set_governance(artifact_type, artifact_id, new_state="active", request=request, service=service)

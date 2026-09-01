@@ -24,12 +24,14 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.routes.ingestion import get_storage
 from app.api.routes.validation import get_report_store as get_validation_report_store
 from app.api.routes.validation import get_schema_registry
 from app.api.routes.integrity import get_integrity_report_store
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
+from app.catalog.repository import CatalogRepository
 from app.core.config import Settings, get_settings
 from app.normalization.models import NormalizationRequest, NormalizationResponse
 from app.normalization.profiles.base import (
@@ -92,8 +94,11 @@ def get_normalization_service(
 async def normalize(
     ingestion_id: str,
     request: NormalizationRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input ingestion/ancestor. Never bypasses an invalid one."),
     service: NormalizationService = Depends(get_normalization_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> NormalizationResponse:
+    enforce_gate(governance_repo, artifact_type="ingestion", artifact_id=ingestion_id, allow_deprecated=allow_deprecated)
     try:
         return service.normalize(
             ingestion_id=ingestion_id,

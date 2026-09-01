@@ -21,8 +21,10 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
+from app.catalog.repository import CatalogRepository
 from app.cleaning.models import CleaningRequest, CleaningResponse
 from app.cleaning.registry import CleaningPolicyNotFoundError, CleaningPolicyRegistry
 from app.cleaning.service import (
@@ -67,8 +69,11 @@ def get_cleaning_service(
 async def clean(
     synchronization_id: str,
     request: CleaningRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input synchronization/ancestor. Never bypasses an invalid one."),
     service: CleaningService = Depends(get_cleaning_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> CleaningResponse:
+    enforce_gate(governance_repo, artifact_type="synchronization", artifact_id=synchronization_id, allow_deprecated=allow_deprecated)
     try:
         return service.clean(synchronization_id=synchronization_id, request=request)
     except (SynchronizationNotFoundError, CleaningPolicyNotFoundError) as exc:

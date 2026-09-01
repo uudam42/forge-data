@@ -18,9 +18,11 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
 from app.api.routes.transformation import get_transformed_store
+from app.catalog.repository import CatalogRepository
 from app.core.config import Settings, get_settings
 from app.qc.checks.drift import BaselineNotFoundError
 from app.qc.models import QCRequest, QCResponse
@@ -64,8 +66,11 @@ def get_qc_service(
 async def run_qc(
     transformation_id: str,
     request: QCRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input transformation run/ancestor. Never bypasses an invalid one."),
     service: QCService = Depends(get_qc_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> QCResponse:
+    enforce_gate(governance_repo, artifact_type="transformation", artifact_id=transformation_id, allow_deprecated=allow_deprecated)
     try:
         return service.run_qc(transformation_id=transformation_id, request=request)
     except (TransformationNotFoundError, QCProfileNotFoundError, BaselineNotFoundError) as exc:

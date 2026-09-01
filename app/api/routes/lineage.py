@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.routes.catalog import get_catalog_service
 from app.catalog.errors import ArtifactNotFoundError, InvalidArtifactTypeError
+from app.catalog.governance_models import EnrichedImpactResponse
 from app.catalog.models import ImpactResponse, LineageGraphResponse
 from app.catalog.service import CatalogService
 
@@ -38,6 +39,27 @@ async def get_impact(
 ) -> ImpactResponse:
     try:
         return service.impact(artifact_type, artifact_id)
+    except InvalidArtifactTypeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except ArtifactNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get(
+    "/{artifact_type}/{artifact_id}/impact/enriched",
+    response_model=EnrichedImpactResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_enriched_impact(
+    artifact_type: str, artifact_id: str, service: CatalogService = Depends(get_catalog_service)
+) -> EnrichedImpactResponse:
+    """Design Requirement 9: everything /impact already returns, plus the
+    source artifact's own governance state, every affected package, and
+    each affected dataset version's computed effective status. Kept as a
+    separate endpoint from /impact (rather than changing that response
+    shape) so existing callers of /impact are never broken."""
+    try:
+        return service.enriched_impact(artifact_type, artifact_id)
     except InvalidArtifactTypeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except ArtifactNotFoundError as exc:

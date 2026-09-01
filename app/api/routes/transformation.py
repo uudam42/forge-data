@@ -23,9 +23,11 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.routes.cleaning import get_cleaned_store
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
+from app.catalog.repository import CatalogRepository
 from app.core.config import Settings, get_settings
 from app.storage.cleaned_store import CleanedArtifactStore
 from app.storage.transformed_store import LocalTransformedArtifactStore, TransformedArtifactStore
@@ -72,8 +74,11 @@ def get_transformation_service(
 async def transform(
     cleaning_id: str,
     request: TransformationRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input cleaning run/ancestor. Never bypasses an invalid one."),
     service: TransformationService = Depends(get_transformation_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> TransformationResponse:
+    enforce_gate(governance_repo, artifact_type="cleaning", artifact_id=cleaning_id, allow_deprecated=allow_deprecated)
     try:
         return service.transform(cleaning_id=cleaning_id, request=request)
     except (CleaningNotFoundError, TransformationProfileNotFoundError) as exc:

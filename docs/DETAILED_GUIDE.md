@@ -29,6 +29,7 @@ v2.1    Crash Safety + Atomic Artifacts (cross-cutting, not a stage) COMPLETE
 v2.2    Large-scale Streaming + Resource Bounds (cross-cutting, not a stage) COMPLETE
 v2.3    Sensor / Schema Plugin System (cross-cutting, not a stage) COMPLETE
 v2.4    Multiprocess Concurrency + SQLite Safety (cross-cutting, not a stage) COMPLETE
+v2.5    Data Governance + Selective Rebuild (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -3827,6 +3828,298 @@ multi-process safety only.
 
 ---
 
+## Data governance and selective rebuild (v2.5)
+
+Every prior milestone answers "what produced this artifact?" (lineage)
+and "what depends on this artifact?" (impact). v2.5 adds the missing
+third question: **"this artifact is now known to be bad — what should
+happen next?"** The answer is governed by one invariant that shapes
+every design choice below:
+
+**Bad data is never repaired in place.** The old artifact stays exactly
+as it was; a governance judgment marks it deprecated/invalid; impact
+analysis finds everyone who depends on it; a selective rebuild produces
+a *new* lineage branch; a corrected dataset version points at the new
+branch. The old branch, and the old dataset version, remain fully
+intact and inspectable forever.
+
+### Governance state: separate from artifact content
+
+Governance is catalog metadata, never a manifest edit. Filesystem
+artifacts stay exactly as immutable as they were in v1.0 — nothing here
+opens, rewrites, or annotates a `manifest.json`.
+
+Three states, deliberately not more:
+
+| State | Meaning | New downstream work through it |
+|---|---|---|
+| **active** (default) | Nothing wrong has been recorded | Allowed |
+| **deprecated** | Still historically valid; a better alternative exists | Blocked by default, allowed with `allow_deprecated=true` |
+| **invalid** | Known incorrect or untrustworthy | Always blocked — no override |
+
+**No row means active** (Design Requirement 3) — `artifact_governance`
+only ever holds rows for artifacts someone has flagged, so the table
+stays proportional to actual bad data, not every artifact ever
+registered. Reactivating an artifact *deletes* its current-state row
+(back to "no row = active") but never touches its event history.
+
+Every state transition is recorded in an **append-only**
+`artifact_governance_events` table — reactivating after an invalidation
+does not erase the invalidation event; it adds a new one. A transition
+always requires a non-empty `reason`; there is no anonymous or silent
+state change. An optional `actor` field is recorded verbatim if the
+caller supplies one — never invented if it's absent, since this system
+has no authentication to derive an identity from.
+
+Allowed transitions (Design Requirement 31): `active → {deprecated,
+invalid}`, `deprecated → {active, invalid}`, `invalid → {active,
+deprecated}`, and every state to itself (deliberately — it lets a
+caller update the reason or attach `superseded_by` without first
+reactivating, and still lands as its own honest event).
+
+**Concurrency**: a governance update's read (current state), transition
+validation, and write all happen inside one already-open `BEGIN
+IMMEDIATE` transaction (see v2.4's `CatalogRepository.transaction()`),
+so two processes racing to update the same artifact are fully
+serialized by SQLite's own write lock — never a lost event, never a
+corrupted current-state row. Verified with real separate OS processes
+in `tests/concurrency/test_v25_governance_and_rebuild_locks.py`.
+
+### The downstream-processing gate
+
+Every pipeline stage's create route (`/normalization`, `/synchronization`,
+`/cleaning`, `/transformation`, `/qc`, `/packaging`) now checks its
+direct input artifact's governance *and the artifact's full upstream
+chain* before calling the (otherwise completely unmodified) stage
+service:
+
+- **Direct input is invalid**, or **an ancestor is invalid** → always
+  rejected (`ARTIFACT_INVALID` / `UPSTREAM_ARTIFACT_INVALID`, HTTP 409).
+  There is no override; an invalid artifact can never feed new work.
+- **Direct input is deprecated**, or **an ancestor is deprecated** →
+  rejected by default (`ARTIFACT_DEPRECATED` /
+  `UPSTREAM_ARTIFACT_DEPRECATED`), but a caller can pass
+  `?allow_deprecated=true` to proceed anyway.
+
+The transitive check (Design Requirement 8, `verify_governance_chain`)
+matters because a direct input can look perfectly active while an
+ancestor several stages back is invalid — e.g. an active synchronization
+built from an invalid IMU normalization. Registering a new dataset
+version goes through the identical gate against the package's full
+upstream chain (Design Requirement 33) — `allow_deprecated=true` is
+available there too, with the same no-override-for-invalid rule.
+
+**A real, load-bearing limitation**: catalog population in this system
+is *scan-driven*, not automatic (established in Step 10/v2.1 — no
+pipeline stage has ever auto-registered into the catalog). This means
+the gate can only see what a `/catalog/scan` has already discovered. An
+artifact created and consumed downstream without an intervening scan
+has no governance information to check against yet, and is silently let
+through. This is not a v2.5-specific gap to fix — it's the same
+"catalog is a rebuildable index, not source of truth for execution"
+principle every prior milestone already relies on, just now also true
+for governance. Call `/catalog/scan` after marking something bad and
+before relying on the gate to block new work through it.
+
+### Enriched impact analysis
+
+`GET /api/v1/lineage/{type}/{id}/impact/enriched` (a new endpoint,
+alongside the original `/impact` which is unchanged for backward
+compatibility) returns everything `/impact` already did, plus:
+
+- the source artifact's own governance state,
+- every affected package,
+- every affected dataset version, each with a computed
+  **effective status**.
+
+### Dataset-version governance and effective status
+
+The `(dataset_name, version) -> package_id` mapping remains exactly as
+immutable as v1.0 made it — nothing in v2.5 ever repoints a version.
+Dataset versions get their own `dataset_version_governance` /
+`dataset_version_governance_events` tables, identical in shape and
+concurrency behavior to artifact governance.
+
+Rather than manually walking every downstream dataset version and
+marking each one individually when an upstream artifact turns out bad,
+`DatasetVersionResponse` exposes a **computed** `effective_status`,
+kept explicitly separate from the version's own explicit governance:
+
+| `effective_status` | Meaning |
+|---|---|
+| `healthy` | No explicit governance, no invalid upstream ancestor |
+| `deprecated` / `invalid` | Explicit governance was set directly on this version (always wins over anything derived) |
+| `affected` | No explicit governance on the version itself, but its package's upstream chain contains an INVALID artifact |
+
+A **deprecated** ancestor alone never marks a version `affected` — per
+the state semantics above, a deprecated artifact's existing descendants
+remain historically intact; only an invalid ancestor propagates this
+way. `effective_status` is pure catalog metadata computed at read time;
+`lineage_fingerprint` is computed exclusively from content/config
+hashes and is never affected by governance state (Design Requirement 28
+— verified directly in `tests/test_v25_dataset_version_governance.py`).
+
+### Selective rebuild: planning
+
+`POST /api/v1/rebuild/plan` takes a `{old_type, old_id, new_type,
+new_id}` replacement pair — a known-bad artifact and an already-created
+replacement for it (built the normal way, through the normal pipeline
+API) — and returns an ordered plan of exactly the downstream descendants
+that need rebuilding.
+
+**Compatibility checked before planning** (Design Requirement 14):
+`old_type` must equal `new_type`; both must already be in the catalog;
+they must share a `session_id` where both have one; for normalization
+specifically, they must share the same schema name and the same source
+`ingestion_id` — a GPS normalization can never replace an IMU
+normalization. A mismatch raises `REBUILD_REPLACEMENT_INCOMPATIBLE`.
+
+**Real topological order, not a linear-chain assumption** (Design
+Requirement 15): the planner runs Kahn's algorithm over the actual
+downstream lineage DAG (with defensive cycle detection, even though the
+catalog's own edge-insertion-time check already makes a cycle
+unreachable), because the DAG genuinely branches — synchronization can
+have several normalization parents, packaging depends on both
+transformation and QC.
+
+**Selective reuse, not a full re-run** (Design Requirement 16): for
+each affected descendant, every parent that ISN'T on the replaced
+lineage is reused completely unchanged. If synchronization depends on
+IMU + GPS + Force/Torque normalization and only IMU is replaced, the
+plan's synchronization step shows GPS and Force/Torque as `"replaced":
+false` with their original IDs, and IMU as `"replaced": true` with
+`"effective_id": null` (not known until execution) — this is the literal
+meaning of *selective*.
+
+**Honesty about config recoverability** (Design Requirement 17): every
+stage's manifest was inspected directly. Synchronization's manifest
+embeds its *entire* effective request (`reference`, `alignment_config`,
+`clock_corrections`) — fully auto-reconstructable. Cleaning,
+transformation, QC, and packaging manifests only ever recorded a
+`*_config_hash` plus the profile/policy name+version — never the raw
+config dict, because a hash can't be inverted. Every plan step for
+those four stages is marked `manual_configuration_required: true` with
+an explicit reason, rather than pretending automatic rebuild is
+possible where it isn't.
+
+**A plan fingerprint** (Design Requirement 23) — `SHA256` over the old
+root, the new root, and every step's stage/old-id/manifest hash/parent
+structure — lets execution detect drift: if the catalog changes
+materially between planning and executing (a new descendant appears,
+for instance), the stored fingerprint no longer matches a freshly
+recomputed one, and execution is rejected with `REBUILD_PLAN_STALE`
+rather than running against a stale description of the DAG.
+
+Plans are held in a **process-local, in-memory store**
+(`app/catalog/rebuild_plan_store.py`) — deliberately not persisted
+anywhere. This is a real, documented limitation: under `uvicorn
+--workers N` (v2.4), a plan built on one worker is invisible to a
+different worker's execute call. No background orchestration, no
+persistence layer, and no distributed plan store were in scope for this
+milestone (see Non-goals); plan-then-execute against the same worker
+(or a single-worker deployment) within a short window is the supported
+usage.
+
+### Selective rebuild: execution
+
+`POST /api/v1/rebuild/execute` takes a `plan_id` plus an optional
+`configs` map (keyed by `"<stage_artifact_type>/<old_artifact_id>"`)
+supplying the raw config for every step the plan flagged
+`manual_configuration_required`. It re-validates the plan's fingerprint
+first (staleness check), then acquires a per-root exclusive lock
+(`selective_rebuild.<old_type>.<old_id>.lock`, the same
+`fcntl.flock`-based, non-blocking, fail-fast primitive as v2.4's
+catalog-wide rebuild lock, just keyed by replacement root instead of
+being global — Design Requirement 24), then runs each step in
+topological order.
+
+**Every step reuses the real, existing stage service directly** — no
+HTTP round-trip, no duplicated stage logic (Design Requirement 18):
+`app/catalog/rebuild_executor.py` constructs
+`SynchronizationService`/`CleaningService`/`TransformationService`/
+`QCService`/`PackagingService` exactly the way each route's own
+`get_X_service` dependency does, and calls their real
+`.synchronize()`/`.clean()`/`.transform()`/`.run_qc()`/`.package()`
+methods. Every one of those already has v2.1's atomic staging/commit
+guarantee, so a crash mid-step inherits that guarantee for free — it's
+never reimplemented here.
+
+**Every rebuild produces new artifact IDs; nothing old is ever
+overwritten** (Design Requirement 19). Immediately after a step
+succeeds, the OLD artifact it replaced is marked `deprecated` with
+`superseded_by_type`/`superseded_by_id` pointing at the new one — a
+governance relationship, not a causal lineage edge (Design Requirement
+20); the real `synchronized_from`/`cleaned_from`/etc. edges from v1.0
+are never touched.
+
+**A step that's skipped (missing manual config) or fails cascades
+correctly**: every step downstream of a skipped/failed one is reported
+as `skipped_upstream_not_rebuilt` rather than being attempted against a
+parent that was never produced — this was a real bug caught during
+development (an early version attempted every step regardless and
+crashed with a confusing `KeyError` deep inside per-stage
+reconstruction; `tests/test_v25_rebuild_execution.py` pins the fix).
+
+The executor does **not** itself register new artifacts into the
+catalog — exactly like every other stage in this system, that stays
+scan-driven. A `/catalog/scan` after `execute` is what makes rebuilt
+artifacts queryable, governable, and eligible for a dataset-version
+registration.
+
+### Corrected dataset versions
+
+The end-to-end workflow this all serves: `dataset@1.0.0 -> package_old`
+is found `affected` by an invalid upstream artifact; a rebuild produces
+`package_new`; the user registers `dataset@1.0.1 -> package_new` through
+the ordinary (unmodified) `POST /datasets/{name}/versions` endpoint.
+`1.0.0` is never touched — it remains registered, immutable, and its
+`effective_status` now correctly reads `affected`. v2.5 never auto-picks
+or auto-increments the next version number (Design Requirement 21); the
+user always chooses and registers it explicitly.
+
+### Catalog rebuild preserves governance
+
+v2.4's `clear_artifact_index()` (used by `POST /catalog/rebuild`, the
+filesystem-reconciliation rebuild — not to be confused with the
+selective rebuild above) already never touched `datasets`/
+`dataset_versions`. v2.5 extends that guarantee explicitly to
+`artifact_governance`, `artifact_governance_events`,
+`dataset_version_governance`, and `dataset_version_governance_events` —
+none of these tables are referenced anywhere in the artifact-index
+rebuild path, and `CatalogService.rebuild()` now asserts their row
+counts are unchanged before/after, the same way it already asserted for
+datasets/versions.
+
+If a governance row's target artifact genuinely disappears from the
+index (its manifest is gone from disk), the governance row is **not**
+deleted — that would destroy audit history over what might be a
+temporary filesystem issue. Instead, `GET /catalog/health` reports a
+`BROKEN_GOVERNANCE_REFERENCE` issue. Marking an artifact invalid is
+itself never a health issue — that's an intentional, healthy governance
+state, kept explicitly distinct from actual catalog integrity problems
+(Design Requirement 27).
+
+### Limitations
+
+- The downstream gate only sees artifacts that have been scanned — see
+  "The downstream-processing gate" above.
+- Rebuild plans are process-local and non-persistent — see "Selective
+  rebuild: planning" above.
+- Automatic rebuild is only possible for synchronization; cleaning,
+  transformation, QC, and packaging always require the caller to supply
+  the raw config at execute time, because only a hash of it was ever
+  recorded.
+- No automatic background rebuild, no job orchestration, no approval
+  workflow, no RBAC, no retention/garbage-collection policy, and no
+  automatic semantic-version incrementing — all explicitly out of scope
+  for this milestone (see the v2.5 Non-goals in the design brief this
+  section was built from).
+- A plan only ever replaces ONE root artifact at a time; rebuilding
+  against multiple independent bad artifacts in one operation isn't
+  supported — build and execute one plan per root.
+
+---
+
 ## Setup
 
 ```bash
@@ -4042,6 +4335,29 @@ SQLite connection — never a sequential-call simulation of concurrency).
 See "Multiprocess concurrency model (v2.4)" above for what each test
 proves and for the live `uvicorn --workers 4` + `curl` verification
 that accompanied this suite.
+
+v2.5 adds 38 more tests to the default suite (1066 total):
+`test_v25_governance_model.py` (14 — absent-means-active, transitions,
+reason requirement, append-only history, catalog-rebuild preservation,
+broken-reference health check), `test_v25_gating_and_impact.py` (4 —
+deprecated direct/ancestor blocking plus `allow_deprecated` override,
+reactivation, enriched-impact sibling exclusion),
+`test_v25_dataset_version_governance.py` (7), `test_v25_rebuild_planner.py`
+(8 — topological order, selective reuse, compatibility checks, plan
+fingerprint), `test_v25_rebuild_execution.py` (4 — stale plan, cascading
+skip on missing config, unknown plan_id), `test_v25_flagship_scenario.py`
+(1 — the full bad-IMU-normalization-to-corrected-v1.1.0 workflow end to
+end through the real HTTP API), and `test_v25_crash_during_rebuild.py`
+(1 — a real `app.storage.atomic.fault_injector`-forced crash partway
+through a 5-step rebuild, proving the already-succeeded step stays
+valid, the failed step leaves nothing partial, and a retry completes
+cleanly). Plus 4 more **opt-in** `tests/concurrency/` tests (22 total)
+in `test_v25_governance_and_rebuild_locks.py` — concurrent governance
+updates on the same artifact never lose an event, and the per-root
+selective-rebuild lock is a real cross-process OS lock. See "Data
+governance and selective rebuild (v2.5)" above for the design each test
+proves, and `tests/v25_helpers.py` for the shared real-pipeline-via-HTTP
+builder these tests share.
 
 ## Deliberate MVP limitations
 
@@ -4421,8 +4737,22 @@ authoritative) artifact/edge/dataset/version registration, and an
 OS-level exclusive rebuild lock — verified with a real multiprocess test
 suite and live `uvicorn --workers 4` + `curl` demos, including a real
 `SIGKILL` mid-write and a subsequent clean `PRAGMA integrity_check`.
-1028 tests in the default suite, plus an opt-in `tests/load/` suite (14
+v2.5 (Data Governance & Selective Rebuild) turns lineage from passive
+observability into active governance: artifacts and dataset versions can
+be marked deprecated/invalid (append-only history, no manifest ever
+touched), a downstream-processing gate blocks new work through an
+invalid artifact or ancestor, enriched impact analysis computes each
+affected dataset version's effective status, and a selective-rebuild
+planner/executor produces a new lineage branch — reusing every
+unaffected sibling parent unchanged — while the old branch and old
+dataset version remain fully intact. Verified end-to-end with a
+flagship bad-normalization-to-corrected-dataset-version scenario, a
+real fault-injected crash mid-rebuild, and a live `uvicorn` + `curl`
+demo covering the full workflow plus a genuine `SIGKILL` during a live
+`/rebuild/execute` call.
+
+1066 tests in the default suite, plus an opt-in `tests/load/` suite (14
 tests, `pytest -m load`) exercising real memory measurement at up to
-1,000,000-row scale, plus an opt-in `tests/concurrency/` suite (18
+1,000,000-row scale, plus an opt-in `tests/concurrency/` suite (22
 tests, `pytest -m concurrency`) exercising real multiprocess contention.
 No Step 11 work has been started or planned as part of this build.

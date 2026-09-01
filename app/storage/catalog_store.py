@@ -107,6 +107,73 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
 
 CREATE INDEX IF NOT EXISTS idx_versions_package ON dataset_versions(package_id);
 
+-- Data governance (v2.5). Deliberately NOT foreign-keyed to `artifacts`:
+-- an artifact can be transiently absent from the artifacts table (before
+-- a first scan, or if its manifest vanished from disk) without that
+-- ever being allowed to cascade-delete governance history -- see
+-- docs/DETAILED_GUIDE.md "Data governance and selective rebuild (v2.5)".
+-- Absence of a row here means ACTIVE; only DEPRECATED/INVALID states are
+-- ever stored, to keep this table proportional to actual bad data, not
+-- every artifact ever registered.
+CREATE TABLE IF NOT EXISTS artifact_governance (
+    artifact_type      TEXT NOT NULL,
+    artifact_id        TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    actor              TEXT,
+    superseded_by_type TEXT,
+    superseded_by_id   TEXT,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY (artifact_type, artifact_id)
+);
+
+-- Append-only. Never updated or deleted -- a reactivation is a new event,
+-- not an erasure of the invalidation event that preceded it.
+CREATE TABLE IF NOT EXISTS artifact_governance_events (
+    event_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_type      TEXT NOT NULL,
+    artifact_id        TEXT NOT NULL,
+    previous_state     TEXT NOT NULL,
+    new_state          TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    actor              TEXT,
+    superseded_by_type TEXT,
+    superseded_by_id   TEXT,
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gov_events_artifact
+    ON artifact_governance_events(artifact_type, artifact_id, event_id);
+
+-- Dataset-version governance. FK-safe unlike artifact_governance because
+-- dataset_versions rows are never deleted by anything, including a
+-- catalog rebuild (same guarantee as `datasets`/`dataset_versions`
+-- themselves -- see CatalogService.rebuild()).
+CREATE TABLE IF NOT EXISTS dataset_version_governance (
+    dataset_name TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    state        TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    actor        TEXT,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (dataset_name, version),
+    FOREIGN KEY (dataset_name, version) REFERENCES dataset_versions(dataset_name, version)
+);
+
+CREATE TABLE IF NOT EXISTS dataset_version_governance_events (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_name   TEXT NOT NULL,
+    version        TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    new_state      TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    actor          TEXT,
+    created_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gov_version_events
+    ON dataset_version_governance_events(dataset_name, version, event_id);
+
 CREATE TABLE IF NOT EXISTS catalog_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

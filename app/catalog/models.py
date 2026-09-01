@@ -266,6 +266,12 @@ class DatasetVersionResponse(BaseModel):
     package_status: str | None = None
     source_qc_status: str | None = None
     lineage_fingerprint: str | None = None
+    # v2.5 — computed, never mutates `status` or the (dataset, version) ->
+    # package_id mapping above; see app.catalog.governance. Kept separate
+    # from `lineage_fingerprint` on purpose (Design Requirement 28):
+    # governance never changes reproducibility.
+    effective_status: str = "healthy"
+    effective_status_reason: str | None = None
 
 
 class ReproducibilityResponse(BaseModel):

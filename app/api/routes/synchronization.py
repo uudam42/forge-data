@@ -26,10 +26,12 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
 from app.api.routes.ingestion import get_storage
 from app.api.routes.validation import get_schema_registry
+from app.catalog.repository import CatalogRepository
 from app.core.config import Settings, get_settings
 from app.storage.base import RawStorage
 from app.storage.normalized_store import LocalNormalizedArtifactStore, NormalizedArtifactStore
@@ -90,8 +92,12 @@ def get_synchronization_service(
 @router.post("", response_model=SynchronizationResponse, status_code=status.HTTP_200_OK)
 async def synchronize(
     request: SynchronizationRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input normalization/ancestor. Never bypasses an invalid one."),
     service: SynchronizationService = Depends(get_synchronization_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> SynchronizationResponse:
+    for stream in request.streams:
+        enforce_gate(governance_repo, artifact_type="normalization", artifact_id=stream.normalization_id, allow_deprecated=allow_deprecated)
     try:
         return service.synchronize(request)
     except (NormalizationNotFoundError, SchemaNotFoundError) as exc:

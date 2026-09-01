@@ -267,3 +267,44 @@ def busy_timeout_writer_worker(db_path: str, busy_timeout_ms: int, go_event, out
         out_queue.put((type(exc).__name__, str(exc)))
     except Exception as exc:
         out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+# ---------------------------------------------------------------------------
+# v2.5 -- governance / selective-rebuild-lock concurrency workers
+# ---------------------------------------------------------------------------
+
+
+def set_governance_worker(db_path: str, artifact_type: str, artifact_id: str, new_state: str, reason: str, out_queue) -> None:
+    """Real multiprocess governance update -- exercises
+    CatalogService.set_artifact_governance's read-decide-write-inside-
+    one-BEGIN-IMMEDIATE-transaction race safety (see repository.py's
+    set_artifact_governance docstring) from a genuinely separate process."""
+    try:
+        repo = _repo(db_path)
+        settings = None  # rebuild lock/executor not needed for a plain governance write
+        service = CatalogService(repo=repo, scanner=None, verifier=None, settings=settings)
+        result = service.set_artifact_governance(artifact_type, artifact_id, new_state=new_state, reason=reason)
+        out_queue.put(("ok", result.state))
+    except CatalogError as exc:
+        out_queue.put((type(exc).__name__, str(exc)))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))
+
+
+def hold_selective_rebuild_lock_worker(data_root: str, old_type: str, old_id: str, hold_seconds: float, ready_event, out_queue) -> None:
+    """Acquires the SAME lock path CatalogService.execute_rebuild() uses
+    for a given (old_type, old_id) replacement root, directly -- proves
+    the selective-rebuild lock is a real, per-root OS lock (Design
+    Requirement 24), without needing two processes to share an in-memory
+    plan (which is deliberately process-local; see rebuild_plan_store.py)."""
+    try:
+        settings = settings_for(data_root)
+        lock = RebuildLock(settings.CATALOG_DB_PATH.parent / f"selective_rebuild.{old_type}.{old_id}.lock")
+        with lock.acquire():
+            ready_event.set()
+            time.sleep(hold_seconds)
+        out_queue.put(("ok", "held_and_released"))
+    except CatalogError as exc:
+        out_queue.put((type(exc).__name__, str(exc)))
+    except Exception as exc:
+        out_queue.put(("UNEXPECTED_" + type(exc).__name__, str(exc)))

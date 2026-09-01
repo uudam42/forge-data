@@ -323,6 +323,138 @@ class CatalogRepository:
         return self._conn.execute("SELECT COUNT(*) FROM dataset_versions").fetchone()[0]
 
     # ------------------------------------------------------------------
+    # Artifact governance (v2.5)
+    #
+    # Concurrency note: unlike upsert_artifact/create_dataset/etc, these
+    # methods use a plain read-then-write, not INSERT+catch-IntegrityError.
+    # That's safe here specifically because every caller performs the
+    # read (via get_artifact_governance, to compute previous_state and
+    # validate the transition) and the write inside the SAME already-open
+    # BEGIN IMMEDIATE transaction (see CatalogService.set_artifact_governance)
+    # -- the write lock is held for the whole read-decide-write sequence,
+    # so no other process's write can interleave. See transaction()'s
+    # docstring for why BEGIN IMMEDIATE makes this safe.
+    # ------------------------------------------------------------------
+
+    def get_artifact_governance(self, artifact_type: str, artifact_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM artifact_governance WHERE artifact_type = ? AND artifact_id = ?",
+            (artifact_type, artifact_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_artifact_governance(
+        self,
+        *,
+        artifact_type: str,
+        artifact_id: str,
+        previous_state: str,
+        new_state: str,
+        reason: str,
+        actor: str | None,
+        superseded_by_type: str | None,
+        superseded_by_id: str | None,
+        updated_at: str,
+    ) -> None:
+        """Writes the current-state row (or deletes it if new_state is
+        "active" -- absence means active, see Design Requirement 3) and
+        appends an immutable event recording the transition. Both writes
+        happen together so the current-state table and the event log can
+        never drift apart."""
+        if new_state == "active":
+            self._conn.execute(
+                "DELETE FROM artifact_governance WHERE artifact_type = ? AND artifact_id = ?",
+                (artifact_type, artifact_id),
+            )
+        else:
+            self._conn.execute(
+                """INSERT INTO artifact_governance
+                   (artifact_type, artifact_id, state, reason, actor, superseded_by_type, superseded_by_id, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(artifact_type, artifact_id) DO UPDATE SET
+                       state = excluded.state, reason = excluded.reason, actor = excluded.actor,
+                       superseded_by_type = excluded.superseded_by_type,
+                       superseded_by_id = excluded.superseded_by_id, updated_at = excluded.updated_at""",
+                (artifact_type, artifact_id, new_state, reason, actor, superseded_by_type, superseded_by_id, updated_at),
+            )
+        self._conn.execute(
+            """INSERT INTO artifact_governance_events
+               (artifact_type, artifact_id, previous_state, new_state, reason, actor,
+                superseded_by_type, superseded_by_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (artifact_type, artifact_id, previous_state, new_state, reason, actor, superseded_by_type, superseded_by_id, updated_at),
+        )
+
+    def list_artifact_governance_events(self, artifact_type: str, artifact_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM artifact_governance_events WHERE artifact_type = ? AND artifact_id = ? ORDER BY event_id",
+            (artifact_type, artifact_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_all_artifact_governance(self) -> list[dict]:
+        rows = self._conn.execute("SELECT * FROM artifact_governance ORDER BY artifact_type, artifact_id").fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Dataset-version governance (v2.5) -- same shape/concurrency
+    # argument as artifact governance above.
+    # ------------------------------------------------------------------
+
+    def get_dataset_version_governance(self, dataset_name: str, version: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM dataset_version_governance WHERE dataset_name = ? AND version = ?",
+            (dataset_name, version),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_dataset_version_governance(
+        self,
+        *,
+        dataset_name: str,
+        version: str,
+        previous_state: str,
+        new_state: str,
+        reason: str,
+        actor: str | None,
+        updated_at: str,
+    ) -> None:
+        if new_state == "active":
+            self._conn.execute(
+                "DELETE FROM dataset_version_governance WHERE dataset_name = ? AND version = ?",
+                (dataset_name, version),
+            )
+        else:
+            self._conn.execute(
+                """INSERT INTO dataset_version_governance
+                   (dataset_name, version, state, reason, actor, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(dataset_name, version) DO UPDATE SET
+                       state = excluded.state, reason = excluded.reason, actor = excluded.actor,
+                       updated_at = excluded.updated_at""",
+                (dataset_name, version, new_state, reason, actor, updated_at),
+            )
+        self._conn.execute(
+            """INSERT INTO dataset_version_governance_events
+               (dataset_name, version, previous_state, new_state, reason, actor, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (dataset_name, version, previous_state, new_state, reason, actor, updated_at),
+        )
+
+    def list_dataset_version_governance_events(self, dataset_name: str, version: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM dataset_version_governance_events WHERE dataset_name = ? AND version = ? ORDER BY event_id",
+            (dataset_name, version),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_all_dataset_version_governance(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM dataset_version_governance ORDER BY dataset_name, version"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # Catalog metadata (build info, schema version)
     # ------------------------------------------------------------------
 

@@ -29,10 +29,12 @@ Status codes:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.routes.governance_gate import enforce_gate, get_governance_repo
 from app.api.routes.qc import get_qc_store
 from app.api.routes.transformation import get_transformed_store
+from app.catalog.repository import CatalogRepository
 from app.core.config import Settings, get_settings
 from app.packaging.exporters.base import ExportDependencyMissingError
 from app.packaging.grouping import MissingGroupMetadataError
@@ -94,8 +96,12 @@ def get_packaging_service(
 async def package_dataset(
     transformation_id: str,
     request: PackagingRequest,
+    allow_deprecated: bool = Query(default=False, description="Allow a deprecated input transformation/QC run/ancestor. Never bypasses an invalid one."),
     service: PackagingService = Depends(get_packaging_service),
+    governance_repo: CatalogRepository = Depends(get_governance_repo),
 ) -> PackagingResponse:
+    enforce_gate(governance_repo, artifact_type="transformation", artifact_id=transformation_id, allow_deprecated=allow_deprecated)
+    enforce_gate(governance_repo, artifact_type="qc", artifact_id=request.qc_id, allow_deprecated=allow_deprecated)
     try:
         return service.package(transformation_id=transformation_id, request=request)
     except (TransformationNotFoundError, QCNotFoundError, PackagingProfileNotFoundError) as exc:

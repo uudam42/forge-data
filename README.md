@@ -279,6 +279,7 @@ v2 development:
 - v2.2 Large-scale Streaming & Resource Bounds — COMPLETE
 - v2.3 Sensor / Schema Plugin System — COMPLETE
 - v2.4 Multiprocess Concurrency & SQLite Safety — COMPLETE
+- v2.5 Data Governance & Selective Rebuild — COMPLETE
 
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
@@ -306,6 +307,16 @@ authoritative) artifact/dataset/version registration, and an OS-level exclusive 
 This is single-machine, multiprocess-safe local catalog access — not a distributed or
 cross-machine database. Details:
 [Full Technical Guide § Multiprocess concurrency model](docs/DETAILED_GUIDE.md#multiprocess-concurrency-model-v24).
+
+**v2.5 (Data Governance & Selective Rebuild)** turns lineage from passive observability into
+active governance: mark an artifact or dataset version deprecated/invalid (append-only
+history, no manifest ever touched), a downstream-processing gate blocks new work through an
+invalid artifact or ancestor, enriched impact analysis shows each affected dataset version's
+computed status, and a selective-rebuild planner/executor produces a new, corrected lineage
+branch — reusing every unaffected sibling parent unchanged — while the old branch and old
+dataset version stay fully intact and inspectable. This is governance-aware lineage and
+descendant rebuild planning, not automatic repair or a job orchestrator. Details:
+[Full Technical Guide § Data governance and selective rebuild](docs/DETAILED_GUIDE.md#data-governance-and-selective-rebuild-v25).
 
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,
