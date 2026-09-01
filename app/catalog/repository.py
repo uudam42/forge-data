@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 
-from app.catalog.errors import ArtifactRegistryConflictError
+from app.catalog.errors import ArtifactRegistryConflictError, CatalogBusyError, DatasetVersionImmutableError
 
 # Fields that must never silently change once an artifact is registered —
 # if a re-scan observes a different value here, the underlying manifest
@@ -24,13 +24,50 @@ from app.catalog.errors import ArtifactRegistryConflictError
 _CONFLICT_FIELDS = ("content_sha256", "manifest_uri", "manifest_sha256", "storage_uri", "metadata_json")
 
 
+def _is_unique_violation(exc: sqlite3.IntegrityError) -> bool:
+    """True for a primary-key/UNIQUE conflict (another writer got there
+    first) — false for anything else (e.g. a FOREIGN KEY violation),
+    which callers must still let propagate."""
+    message = str(exc)
+    return "UNIQUE constraint failed" in message or "PRIMARY KEY constraint failed" in message
+
+
+def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
 class CatalogRepository:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, db_path: str = "", busy_timeout_ms: int = 5000) -> None:
         self._conn = conn
+        self._db_path = db_path
+        self._busy_timeout_ms = busy_timeout_ms
 
     @contextlib.contextmanager
-    def transaction(self):
-        self._conn.execute("BEGIN")
+    def transaction(self, *, operation: str = "transaction"):
+        """Opens a write transaction. Uses BEGIN IMMEDIATE (not the
+        bare/deferred BEGIN SQLite defaults to) so the write lock is
+        acquired up front, at the start of the transaction, rather than
+        lazily on the first write statement — this is what makes the
+        "act, then let a UNIQUE/PK conflict decide" pattern in
+        upsert_artifact/insert_edge/create_dataset/create_dataset_version
+        race-safe: only one process can hold this lock at a time, so a
+        concurrent writer either finishes-and-commits before this one
+        starts, or blocks (up to busy_timeout_ms) and never interleaves
+        with it.
+
+        If the lock can't be acquired within busy_timeout_ms, SQLite
+        raises "database is locked" -- this is caught here and re-raised
+        as a structured CatalogBusyError rather than a raw
+        sqlite3.OperationalError, per the v2.4 error model."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_locked_error(exc):
+                raise CatalogBusyError(
+                    operation=operation, timeout_ms=self._busy_timeout_ms, db_path=self._db_path
+                ) from exc
+            raise
         try:
             yield
             self._conn.execute("COMMIT")
@@ -52,9 +89,14 @@ class CatalogRepository:
     def upsert_artifact(self, record: dict) -> str:
         """Returns "inserted" or "unchanged". Raises
         ArtifactRegistryConflictError if an existing entry's identity
-        fields disagree with the new record — never silently overwritten."""
-        existing = self.get_artifact(record["artifact_type"], record["artifact_id"])
-        if existing is None:
+        fields disagree with the new record — never silently overwritten.
+
+        Race-safe: attempts the INSERT first and lets the
+        (artifact_type, artifact_id) primary key be the final authority,
+        rather than trusting a prior SELECT that a concurrent writer may
+        have invalidated in the meantime (see transaction() for why this
+        is safe under BEGIN IMMEDIATE)."""
+        try:
             self._conn.execute(
                 """INSERT INTO artifacts
                    (artifact_type, artifact_id, pipeline_stage, status, storage_uri,
@@ -66,13 +108,17 @@ class CatalogRepository:
                 record,
             )
             return "inserted"
+        except sqlite3.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            existing = self.get_artifact(record["artifact_type"], record["artifact_id"])
 
         for field in _CONFLICT_FIELDS:
             if existing.get(field) != record.get(field):
                 raise ArtifactRegistryConflictError(
                     f"{record['artifact_type']}/{record['artifact_id']}: field '{field}' would change "
                     f"from {existing.get(field)!r} to {record.get(field)!r} — refusing to overwrite"
-                )
+                ) from None
         return "unchanged"
 
     def list_artifacts(
@@ -119,21 +165,24 @@ class CatalogRepository:
         self, *, parent_type: str, parent_id: str, child_type: str, child_id: str, relationship: str
     ) -> bool:
         """Idempotent. Returns True if newly inserted, False if it already
-        existed unchanged."""
-        existing = self._conn.execute(
-            """SELECT 1 FROM lineage_edges WHERE parent_artifact_type=? AND parent_artifact_id=?
-               AND child_artifact_type=? AND child_artifact_id=? AND relationship=?""",
-            (parent_type, parent_id, child_type, child_id, relationship),
-        ).fetchone()
-        if existing is not None:
+        existed unchanged.
+
+        Race-safe: attempts the INSERT first and lets the 5-column
+        primary key be the final authority instead of a prior SELECT. A
+        FOREIGN KEY violation (parent/child artifact genuinely missing)
+        is a different failure mode and is left to propagate."""
+        try:
+            self._conn.execute(
+                """INSERT INTO lineage_edges
+                   (parent_artifact_type, parent_artifact_id, child_artifact_type, child_artifact_id, relationship)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (parent_type, parent_id, child_type, child_id, relationship),
+            )
+            return True
+        except sqlite3.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
             return False
-        self._conn.execute(
-            """INSERT INTO lineage_edges
-               (parent_artifact_type, parent_artifact_id, child_artifact_type, child_artifact_id, relationship)
-               VALUES (?, ?, ?, ?, ?)""",
-            (parent_type, parent_id, child_type, child_id, relationship),
-        )
-        return True
 
     def get_parents(self, artifact_type: str, artifact_id: str) -> list[dict]:
         rows = self._conn.execute(
@@ -176,11 +225,25 @@ class CatalogRepository:
         row = self._conn.execute("SELECT * FROM datasets WHERE dataset_name = ?", (dataset_name,)).fetchone()
         return dict(row) if row is not None else None
 
-    def create_dataset(self, *, dataset_name: str, description: str | None, metadata_json: str, created_at: str) -> None:
-        self._conn.execute(
-            "INSERT INTO datasets (dataset_name, description, metadata_json, created_at) VALUES (?, ?, ?, ?)",
-            (dataset_name, description, metadata_json, created_at),
-        )
+    def create_dataset(self, *, dataset_name: str, description: str | None, metadata_json: str, created_at: str) -> bool:
+        """Returns True if this call created the dataset, False if it
+        already existed (idempotent by name — a repeat call never
+        compares or overwrites description/metadata).
+
+        Race-safe: attempts the INSERT first and lets the dataset_name
+        primary key be the final authority instead of a prior SELECT, so
+        two processes creating the same dataset concurrently never raise
+        a raw sqlite3.IntegrityError — the loser simply learns it lost."""
+        try:
+            self._conn.execute(
+                "INSERT INTO datasets (dataset_name, description, metadata_json, created_at) VALUES (?, ?, ?, ?)",
+                (dataset_name, description, metadata_json, created_at),
+            )
+            return True
+        except sqlite3.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            return False
 
     def list_datasets(self) -> list[dict]:
         return [dict(r) for r in self._conn.execute("SELECT * FROM datasets ORDER BY dataset_name").fetchall()]
@@ -204,13 +267,37 @@ class CatalogRepository:
         tags_json: str,
         status: str,
         created_at: str,
-    ) -> None:
-        self._conn.execute(
-            """INSERT INTO dataset_versions
-               (dataset_name, version, package_id, description, tags_json, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (dataset_name, version, package_id, description, tags_json, status, created_at),
-        )
+    ) -> str:
+        """Returns "created" or "unchanged" (idempotent re-registration of
+        the exact same dataset+version+package). Raises
+        DatasetVersionImmutableError if an existing entry already points
+        to a DIFFERENT package — a version can never be reassigned.
+
+        Race-safe: attempts the INSERT first and lets the
+        (dataset_name, version) primary key be the final authority
+        instead of a prior SELECT, so two processes racing to register
+        the same dataset+version resolve deterministically: exactly one
+        "created", and the other either "unchanged" (same package — an
+        idempotent retry) or a DatasetVersionImmutableError (different
+        package — a genuine conflict), never a raw IntegrityError."""
+        try:
+            self._conn.execute(
+                """INSERT INTO dataset_versions
+                   (dataset_name, version, package_id, description, tags_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (dataset_name, version, package_id, description, tags_json, status, created_at),
+            )
+            return "created"
+        except sqlite3.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            existing = self.get_dataset_version(dataset_name, version)
+            if existing is not None and existing["package_id"] == package_id:
+                return "unchanged"
+            raise DatasetVersionImmutableError(
+                f"{dataset_name}@{version} already points to package "
+                f"'{existing['package_id'] if existing else '?'}' — it can never be reassigned to '{package_id}'"
+            ) from None
 
     def list_dataset_versions(self, dataset_name: str) -> list[dict]:
         rows = self._conn.execute(

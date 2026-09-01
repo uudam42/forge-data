@@ -27,10 +27,13 @@ parquet = [
 testpaths = ["tests"]
 markers = [
     "load: large-data load/scale tests (deselected by default; run explicitly with `pytest -m load`)",
+    "concurrency: real multiprocess concurrency tests, v2.4 (deselected by default; run explicitly with `pytest -m concurrency`)",
 ]
-# Plain `pytest` skips load tests so normal development stays fast;
-# `pytest -m load` on the command line overrides this and runs only them.
-addopts = "-m 'not load'"
+# Plain `pytest` skips load and concurrency tests so normal development
+# stays fast; `pytest -m load` / `pytest -m concurrency` on the command
+# line overrides this (pytest's -m is last-wins, not combined) and runs
+# only that marker's tests.
+addopts = "-m 'not load and not concurrency'"
 
 [build-system]
 requires = ["setuptools>=68"]

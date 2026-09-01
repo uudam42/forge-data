@@ -11,14 +11,17 @@ Status codes:
 - 409: attempting to reassign an existing (dataset, version) to a
   different package_id, or registering a version for a package that
   isn't an accepted `completed` package
+- 503: the catalog was too busy to acquire a write lock within the
+  configured timeout (CATALOG_BUSY) — transient, safe to retry
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
-from app.api.routes.catalog import get_catalog_service
+from app.api.routes.catalog import get_catalog_service, raise_busy
 from app.catalog.errors import (
+    CatalogBusyError,
     DatasetNotFoundError,
     DatasetVersionImmutableError,
     DatasetVersionNotFoundError,
@@ -49,6 +52,8 @@ async def create_dataset(
         )
     except InvalidDatasetNameError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except CatalogBusyError as exc:
+        raise_busy(exc)
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return result
 
@@ -83,6 +88,8 @@ async def register_version(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except DatasetVersionImmutableError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except CatalogBusyError as exc:
+        raise_busy(exc)
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return result
 

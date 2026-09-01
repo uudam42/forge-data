@@ -5,13 +5,17 @@ one of these methods.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import datetime, timezone
 
 from app.catalog import graph, versioning
 from app.catalog.errors import (
     ArtifactNotFoundError,
+    CatalogBusyError,
+    CatalogLockFailedError,
     CatalogRebuildFailedError,
+    CatalogRebuildInProgressError,
     CatalogScanFailedError,
     DatasetAlreadyExistsError,
     DatasetNotFoundError,
@@ -43,6 +47,7 @@ from app.catalog.models import (
     VerificationNodeResult,
     VerificationResponse,
 )
+from app.catalog.rebuild_lock import RebuildLock
 from app.catalog.repository import CatalogRepository
 from app.catalog.scanner import BrokenLineageError, CatalogScanner
 from app.catalog.serialization import canonical_json, compute_lineage_fingerprint
@@ -56,10 +61,27 @@ _STATUS_KEY = "last_scan_at"
 
 
 class CatalogService:
-    def __init__(self, *, repo: CatalogRepository, scanner: CatalogScanner, verifier: ArtifactVerifier) -> None:
+    def __init__(
+        self,
+        *,
+        repo: CatalogRepository,
+        scanner: CatalogScanner,
+        verifier: ArtifactVerifier,
+        rebuild_lock: RebuildLock | None = None,
+    ) -> None:
         self._repo = repo
         self._scanner = scanner
         self._verifier = verifier
+        # Optional so tests exercising create_dataset/register_version
+        # (which never touch rebuild()) don't need to construct one. The
+        # real HTTP dependency (app.api.routes.catalog.get_catalog_service)
+        # always passes a real RebuildLock -- see Design Requirement 7.
+        self._rebuild_lock_obj = rebuild_lock
+
+    def _rebuild_lock(self):
+        if self._rebuild_lock_obj is None:
+            return contextlib.nullcontext()
+        return self._rebuild_lock_obj.acquire()
 
     # ------------------------------------------------------------------
     # Scan / rebuild
@@ -68,9 +90,17 @@ class CatalogService:
     def scan(self) -> ScanResult:
         logger.info("CATALOG_SCAN_STARTED")
         try:
-            with self._repo.transaction():
+            with self._repo.transaction(operation="scan"):
                 outcome = self._scanner.scan(self._repo, strict=False)
                 self._repo.set_metadata(_STATUS_KEY, datetime.now(timezone.utc).isoformat())
+        except CatalogBusyError:
+            # Structured contention error, not a scan failure -- the
+            # catalog and filesystem are both untouched; let the caller
+            # see CATALOG_BUSY (with operation/timeout_ms/db_path) and
+            # decide whether to retry, rather than burying it in a
+            # generic CatalogScanFailedError.
+            logger.warning("CATALOG_SCAN_BUSY")
+            raise
         except Exception:
             logger.error("CATALOG_SCAN_FAILED")
             raise CatalogScanFailedError("Catalog scan failed") from None
@@ -100,10 +130,19 @@ class CatalogService:
         datasets_before = self._repo.count_datasets()
         versions_before = self._repo.count_dataset_versions()
         try:
-            with self._repo.transaction():
-                self._repo.clear_artifact_index()
-                outcome = self._scanner.scan(self._repo, strict=True)
-                self._repo.set_metadata(_STATUS_KEY, datetime.now(timezone.utc).isoformat())
+            with self._rebuild_lock():
+                with self._repo.transaction(operation="rebuild"):
+                    self._repo.clear_artifact_index()
+                    outcome = self._scanner.scan(self._repo, strict=True)
+                    self._repo.set_metadata(_STATUS_KEY, datetime.now(timezone.utc).isoformat())
+        except (CatalogBusyError, CatalogRebuildInProgressError, CatalogLockFailedError):
+            # Structured contention/locking errors, not rebuild failures --
+            # the catalog is untouched in every one of these cases (the
+            # lock, or the write transaction, was never acquired). Let the
+            # caller see the specific structured error rather than a
+            # generic CatalogRebuildFailedError.
+            logger.warning("CATALOG_REBUILD_BUSY_OR_LOCKED")
+            raise
         except BrokenLineageError as exc:
             logger.error("CATALOG_REBUILD_FAILED reason=broken_lineage")
             raise CatalogRebuildFailedError(f"Strict rebuild aborted: {exc}") from exc
@@ -297,19 +336,21 @@ class CatalogService:
 
     def create_dataset(self, *, dataset_name: str, description: str | None, metadata: dict) -> tuple[DatasetResponse, bool]:
         """Returns (response, created) — created=False means an identical
-        dataset already existed (idempotent)."""
-        versioning.validate_dataset_name(dataset_name)
-        existing = self._repo.get_dataset(dataset_name)
-        if existing is not None:
-            return self._to_dataset_response(existing), False
+        dataset already existed (idempotent).
 
-        with self._repo.transaction():
+        Race-safe: always attempts the write and lets
+        CatalogRepository.create_dataset's dataset_name primary key
+        decide who won, rather than checking existence first and racing
+        another process between that check and the insert."""
+        versioning.validate_dataset_name(dataset_name)
+        with self._repo.transaction(operation="create_dataset"):
             created_at = datetime.now(timezone.utc).isoformat()
-            self._repo.create_dataset(
+            created = self._repo.create_dataset(
                 dataset_name=dataset_name, description=description, metadata_json=canonical_json(metadata), created_at=created_at
             )
-        logger.info("DATASET_CREATED dataset_name=%s", dataset_name)
-        return self._to_dataset_response(self._repo.get_dataset(dataset_name)), True
+        if created:
+            logger.info("DATASET_CREATED dataset_name=%s", dataset_name)
+        return self._to_dataset_response(self._repo.get_dataset(dataset_name)), created
 
     def list_datasets(self) -> list[DatasetResponse]:
         return [self._to_dataset_response(d) for d in self._repo.list_datasets()]
@@ -348,18 +389,15 @@ class CatalogService:
         if qc_status not in ACCEPTED_QC_STATUSES:
             raise PackageNotAcceptedError(f"Package '{package_id}' source_qc_status={qc_status!r} is not accepted")
 
-        existing = self._repo.get_dataset_version(dataset_name, version)
-        if existing is not None:
-            if existing["package_id"] == package_id:
-                return self._to_version_response(existing), False
-            raise DatasetVersionImmutableError(
-                f"{dataset_name}@{version} already points to package '{existing['package_id']}' — "
-                f"it can never be reassigned to '{package_id}'"
-            )
-
-        with self._repo.transaction():
+        # Race-safe: always attempt the write and let
+        # CatalogRepository.create_dataset_version's (dataset_name, version)
+        # primary key decide the outcome ("created" / idempotent
+        # "unchanged" / DatasetVersionImmutableError conflict), rather than
+        # checking existence first and racing another process between
+        # that check and the insert.
+        with self._repo.transaction(operation="register_version"):
             created_at = datetime.now(timezone.utc).isoformat()
-            self._repo.create_dataset_version(
+            outcome = self._repo.create_dataset_version(
                 dataset_name=dataset_name,
                 version=version,
                 package_id=package_id,
@@ -368,8 +406,10 @@ class CatalogService:
                 status="active",
                 created_at=created_at,
             )
-        logger.info("DATASET_VERSION_REGISTERED dataset_name=%s version=%s package_id=%s", dataset_name, version, package_id)
-        return self._to_version_response(self._repo.get_dataset_version(dataset_name, version)), True
+        created = outcome == "created"
+        if created:
+            logger.info("DATASET_VERSION_REGISTERED dataset_name=%s version=%s package_id=%s", dataset_name, version, package_id)
+        return self._to_version_response(self._repo.get_dataset_version(dataset_name, version)), created
 
     def list_versions(self, dataset_name: str) -> list[DatasetVersionResponse]:
         if self._repo.get_dataset(dataset_name) is None:

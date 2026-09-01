@@ -91,6 +91,24 @@ class Settings(BaseSettings):
     # a rebuild must fully restore catalog state from the filesystem.
     CATALOG_DB_PATH: Path = Path("data/catalog/catalog.db")
 
+    # Multiprocess concurrency & SQLite safety (v2.4). See
+    # docs/DETAILED_GUIDE.md#multiprocess-concurrency-model-v24.
+
+    # How long a connection waits for a write lock before SQLite raises
+    # "database is locked" -- Forge Data catches that and raises a
+    # structured CatalogBusyError instead. Bounded, never infinite.
+    CATALOG_BUSY_TIMEOUT_MS: int = 5000
+
+    # "WAL" (default) lets readers proceed while a writer holds the lock;
+    # "DELETE" is SQLite's own default rollback-journal mode. Verified,
+    # not assumed, at connection time -- see get_connection().
+    CATALOG_JOURNAL_MODE: str = "WAL"
+
+    # 0 = fail immediately if another process already holds the rebuild
+    # lock (this project's chosen policy -- see "Rebuild lock design" in
+    # the docs). A positive value would wait up to that many ms instead.
+    CATALOG_REBUILD_LOCK_TIMEOUT_MS: int = 0
+
     # Crash safety / atomic artifact commit (v2.1). See
     # docs/DETAILED_GUIDE.md#crash-consistency-and-atomic-artifacts.
     STAGING_DIR_NAME: str = ".staging"

@@ -28,6 +28,7 @@ Step 10 Versioning + Lineage       COMPLETE
 v2.1    Crash Safety + Atomic Artifacts (cross-cutting, not a stage) COMPLETE
 v2.2    Large-scale Streaming + Resource Bounds (cross-cutting, not a stage) COMPLETE
 v2.3    Sensor / Schema Plugin System (cross-cutting, not a stage) COMPLETE
+v2.4    Multiprocess Concurrency + SQLite Safety (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -3603,6 +3604,229 @@ See `docs/ADDING_SENSOR.md` for the practical, step-by-step guide.
 
 ---
 
+## Multiprocess concurrency model (v2.4)
+
+Every prior milestone assumed one process touching the workspace at a
+time. v2.4 makes Forge Data safe when **multiple local processes on the
+same machine** — several `uvicorn` workers, concurrent pipeline
+requests, independent scripts — share one workspace and one
+`catalog.db`. The invariant that governs every decision below:
+**concurrency must never weaken immutability, lineage, or atomic
+visibility.** If a choice ever traded one of those away for
+throughput, it was rejected.
+
+This is explicitly **not** distributed or cross-machine concurrency.
+There is no distributed lock, no leader election, no message queue, no
+Postgres, no orchestrator, no job scheduler. Everything here is a
+single-machine, multi-process problem, solved with what the local
+filesystem and stdlib `sqlite3` already provide: OS-level file locking
+(`fcntl.flock`) and SQLite's own WAL journal mode.
+
+### SQLite connection policy
+
+- **One connection per process, opened fresh per unit of work** — never
+  a shared global, never passed between processes (a `sqlite3.Connection`
+  isn't even picklable). `app.api.routes.catalog.get_catalog_service`
+  already opened one connection per HTTP request before v2.4; every
+  concurrency test and demo below does the same for whatever "process"
+  means in that context (an HTTP request, a script, a worker).
+- **WAL journaling, verified, not assumed** — `get_connection()`
+  (`app/storage/catalog_store.py`) runs `PRAGMA journal_mode = WAL` and
+  reads back SQLite's own reply; if it doesn't say `wal` (e.g. a
+  filesystem that rejects WAL's shared-memory file), `get_connection`
+  raises `JournalModeNotAppliedError` immediately rather than silently
+  running without WAL's concurrent-reader guarantee. WAL lets readers
+  proceed while a writer holds the write lock — verified live: readers
+  in one process see a writer's committed state from another the
+  instant it commits, never a partial write.
+- **A bounded busy timeout** — `PRAGMA busy_timeout` (default 5000ms,
+  `CATALOG_BUSY_TIMEOUT_MS`) makes a writer wait for a concurrent
+  writer's lock instead of failing instantly, but only up to that
+  bound. Exceeding it raises SQLite's own "database is locked", which
+  `CatalogRepository.transaction()` catches and re-raises as a
+  structured `CatalogBusyError(operation, timeout_ms, db_path)` — never
+  a raw `sqlite3.OperationalError` reaching an API caller.
+- **`foreign_keys = ON`** on every connection (SQLite's own default is
+  off) — lineage-edge foreign keys are enforced at the database level,
+  not just in application code.
+- **One one-time exception**: the very first `PRAGMA journal_mode = WAL`
+  ever run against a brand-new `catalog.db` briefly needs exclusive
+  access to rewrite the file header, and SQLite's busy_timeout does not
+  reliably cover that specific statement — confirmed directly with two
+  processes opening a fresh database at the same instant. `get_connection`
+  wraps only this one call in a small, bounded retry (≤10 attempts,
+  capped well under a second) — every connection after the first sees
+  WAL already applied and never takes this path.
+
+### Short write transactions and race-safe writes
+
+`CatalogRepository.transaction()` now opens with `BEGIN IMMEDIATE`
+(SQLite's default `BEGIN` is deferred — it doesn't actually take the
+write lock until the first write statement, which is what let two
+processes interleave a check and a write against the same row before
+v2.4). `BEGIN IMMEDIATE` takes the write lock up front, so from that
+point on exactly one process is ever inside a catalog write transaction
+system-wide.
+
+That serialization is what makes the second half of the fix safe: every
+write path that used to **check, then act** (`SELECT` for an existing
+row, then conditionally `INSERT`) now **acts, then lets the database's
+own primary key decide**:
+
+| Operation | Old (racy) pattern | v2.4 pattern | Race outcome |
+|---|---|---|---|
+| Register artifact | `SELECT` → `INSERT` if absent | `INSERT`, catch `IntegrityError`, re-fetch and compare | Same content → idempotent `"unchanged"`; different content → `ArtifactRegistryConflictError` |
+| Register lineage edge | `SELECT` → `INSERT` if absent | `INSERT`, catch `IntegrityError` | Already exists → idempotent `False`; genuine FK violation still propagates |
+| Create dataset | `SELECT` → return existing, else `INSERT` | `INSERT`, catch `IntegrityError` | Already exists → idempotent (first writer's description/metadata wins) |
+| Register dataset version | `SELECT` → compare `package_id`, else `INSERT` | `INSERT`, catch `IntegrityError`, re-fetch and compare `package_id` | Same package → idempotent `"unchanged"`; different package → `DatasetVersionImmutableError` |
+| Seed `catalog_schema_version` | `SELECT` → `INSERT` if absent | Cheap `SELECT` short-circuit (fast, never blocks under WAL) + `INSERT ... ON CONFLICT DO NOTHING` | Two simultaneous first-opens of a fresh `catalog.db` never raise a raw `IntegrityError` |
+
+Every one of these is now correct regardless of which process's
+`BEGIN IMMEDIATE` wins the race — the losing process never sees an
+unhandled `sqlite3.IntegrityError`, only the specific structured
+outcome its use case defines as correct.
+
+### Rebuild: an exclusive maintenance operation
+
+`CatalogService.rebuild()` clears and reconstructs the entire artifact
+index from the filesystem in one pass — a maintenance operation, not a
+routine write, so at most one process may run it at a time. This is
+enforced by `app/catalog/rebuild_lock.py`'s `RebuildLock`, a real
+OS-level lock (`fcntl.flock(LOCK_EX | LOCK_NB)`) on
+`data/catalog/catalog.rebuild.lock` — deliberately **not** a "does a
+lock file exist" check, which is vulnerable to a stale file left behind
+by a process that crashed mid-rebuild and would then block every future
+rebuild forever. `flock` is released by the kernel the instant the
+holding process exits for any reason, including `SIGKILL` — verified
+live by killing a lock-holding process outright and confirming the next
+rebuild acquires the lock immediately, with no stale-lock cleanup logic
+anywhere.
+
+Policy: **non-blocking, fail immediately**
+(`CATALOG_REBUILD_LOCK_TIMEOUT_MS = 0`). If another process already
+holds the rebuild lock, the caller gets a structured
+`CatalogRebuildInProgressError` right away rather than waiting — this
+project's explicit choice for being simpler to reason about than a
+bounded wait, at the cost of a rebuild call occasionally needing a
+manual retry.
+
+The lock file's contents (`pid`, `hostname`, `started_at`,
+`operation_id`) are **diagnostic-only** — printed in the conflict error
+for a human debugging "who's rebuilding right now" — and are never used
+to decide whether the lock is actually held. Only the OS `flock` result
+decides that, because PIDs can be reused and a stale PID in a file would
+be an unsafe thing to trust.
+
+### Lock acquisition order
+
+Every write path in Forge Data acquires locks in the same fixed order,
+so no two code paths can deadlock against each other:
+
+1. **Filesystem work first** (writing to a staging directory, hashing,
+   atomic rename into place — v2.1's staging/commit primitive) —
+   entirely before any SQLite transaction opens.
+2. **Atomic publish** — the staging→destination rename that makes an
+   artifact visible, per v2.1. Still no SQLite transaction open.
+3. **A short catalog write transaction** (`BEGIN IMMEDIATE` → the
+   INSERT(s) → `COMMIT`) registers the already-published artifact.
+
+Rebuild follows the same shape with one lock prepended: **the exclusive
+rebuild lock first, then a catalog write transaction** — never the
+reverse, which is what keeps rebuild from being able to deadlock against
+a normal registration (a registration never takes the rebuild lock at
+all).
+
+### The filesystem/catalog non-atomicity boundary
+
+Publishing a filesystem artifact and registering it in the catalog are
+**deliberately not one distributed transaction** — there is no
+two-phase commit between the filesystem and SQLite. This means a valid,
+fully-committed artifact can transiently exist on disk with no matching
+catalog row yet (between step 2 and step 3 above, or if a process dies
+in between). This is accepted, not a bug: the filesystem manifest
+remains the single source of truth (the principle established in Step
+10/v2.1), the catalog is a rebuildable index over it, and a later
+`scan()` or `rebuild()` reconciles any such gap by discovering and
+registering the artifact from its manifest.
+
+The direction of that asymmetry is intentional and load-bearing: **a
+catalog registration failure must never delete or roll back a valid,
+already-published filesystem artifact.** `CatalogRepository`'s
+`transaction()` rolls back only the SQLite side on failure — it never
+touches the filesystem. A partially-registered artifact is a temporary,
+self-healing inconsistency; a deleted artifact would be permanent data
+loss. Given the choice, Forge Data always fails toward "reconcile later"
+rather than "delete now."
+
+### Known limitation: scan/rebuild hold a long write transaction
+
+`CatalogScanner.scan()` walks the filesystem lazily — each artifact's
+manifest is hashed and parsed on the fly as `CatalogService.scan()`/
+`rebuild()` iterate it, and that iteration happens *inside* the open
+catalog write transaction (cycle-detection and missing-parent checks
+need the DB state built up by earlier artifacts in the same pass, so a
+clean "collect everything, then write" split isn't a small change).
+This means a slow scan over a very large workspace holds the write lock
+for the scan's whole duration — a real, documented trade-off, not an
+oversight. It's mitigated, not eliminated: any writer that collides with
+an in-progress scan/rebuild waits up to `CATALOG_BUSY_TIMEOUT_MS` and
+then gets a structured `CatalogBusyError` rather than hanging forever or
+crashing — verified live (see below). Design Requirement 6's framing of
+rebuild as a maintenance operation, run occasionally rather than as a
+routine request-path write, is the intended mitigation for this in
+practice.
+
+### Verification
+
+**Automated**: `tests/concurrency/` (`pytest -m concurrency`, kept
+separate from the default suite exactly like v2.2's `load` marker) runs
+every scenario against **real OS processes** — `multiprocessing` with
+the `spawn` context, never a sequential simulation of concurrency —
+covering: WAL/PRAGMA verification, per-process connections, concurrent
+distinct-artifact registration, same-artifact races (identical content
+idempotent, differing content a structured conflict), concurrent
+identical/duplicate lineage-edge insertion, concurrent dataset creation,
+same-version-same-package races (idempotent), same-version-different-
+package races (structured conflict), competing rebuilds (one lock
+owner, one structured conflict), the rebuild lock releasing after both
+a normal exit and an exception, the rebuild lock releasing when its
+holder is `SIGKILL`ed outright, a writer waiting out a busy_timeout and
+succeeding, a writer exceeding its busy_timeout and getting a structured
+`CatalogBusyError`, a real process crash (`os._exit`, no cleanup)
+mid-write-transaction leaving the catalog fully recoverable
+(`PRAGMA integrity_check` = `ok`, `PRAGMA foreign_key_check` = no
+violations), and a multi-round mixed-writer stress pass ending in a full
+consistency check.
+
+**Live**: run against a real `uvicorn --workers 4` process (genuine
+separate OS worker processes, not simulated) with real `curl` requests:
+4 concurrent ingestion uploads all succeeded with distinct artifacts; 4
+concurrent `/catalog/scan` calls all returned 200 with exactly one
+reporting the new registrations and the rest correctly reporting them
+as already-registered; a same-version/same-package registration race
+returned exactly one 201 and the rest identical 200s; a same-version/
+different-package race returned exactly one 201 and the rest a
+structured 409 `DATASET_VERSION_IMMUTABLE`; an externally-held rebuild
+lock made a concurrent `/catalog/rebuild` call return a structured 409
+`CATALOG_REBUILD_IN_PROGRESS` naming the real holder PID, with a normal
+200 once released; and `SIGKILL`ing a live worker process mid-burst of
+40 concurrent writes still completed all 40 successfully (uvicorn
+routed around the dead worker and auto-respawned it), with
+`PRAGMA integrity_check` = `ok` and zero `foreign_key_check` violations
+afterward.
+
+### Non-goals
+
+No distributed workers, no cloud task queues, no Celery/Redis/Kafka/
+Ray/Dask/Kubernetes, no cross-machine coordination, no leader election,
+no distributed or remote-filesystem locking, no PostgreSQL, no auth or
+multi-tenancy, no web dashboard, no orchestration or job scheduler, no
+selective/partial rebuild, no CLI productization. All of that remains
+explicitly out of scope — this milestone is single-machine,
+multi-process safety only.
+
+---
+
 ## Setup
 
 ```bash
@@ -3706,6 +3930,9 @@ Environment variables (all optional, sensible defaults provided):
 | `DISK_RESERVE_BYTES`        | `104857600` (100 MiB) | Headroom kept free beyond a stage's disk-space estimate (v2.2) |
 | `DISK_SAFETY_FACTOR`        | `1.2`                | Multiplier applied to a stage's disk-space estimate before comparing (v2.2) |
 | `MIN_FREE_DISK_BYTES`       | `52428800` (50 MiB)  | Absolute free-space floor, independent of any estimate (v2.2) |
+| `CATALOG_BUSY_TIMEOUT_MS`   | `5000`               | How long a catalog write waits for another process's write lock before a structured `CatalogBusyError` (v2.4) |
+| `CATALOG_JOURNAL_MODE`      | `WAL`                | SQLite journal mode, verified (not assumed) at connection time (v2.4) |
+| `CATALOG_REBUILD_LOCK_TIMEOUT_MS` | `0`            | `0` = fail immediately if another process holds the rebuild lock; a positive value waits up to that long instead (v2.4) |
 
 ## How raw storage works
 
@@ -3799,6 +4026,22 @@ document's "Extension cost" claims. Plus 3 more **opt-in**
 `tests/load/` tests (14 total, `pytest -m load`) proving Force/Torque
 validation/normalization/transformation stay within v2.2's bounded-
 memory contracts at 1,000,000-row scale.
+
+v2.4 leaves the default suite at 1028 (no default-suite behavior
+changed, only internal race-safety) and adds a separate, **opt-in**
+`tests/concurrency/` suite (18 tests, run via `pytest -m concurrency`,
+deselected by default exactly like `load`) under
+`tests/concurrency/`: `test_connections_and_wal.py`,
+`test_artifact_and_edge_races.py`, `test_dataset_version_races.py`,
+`test_rebuild_lock.py`, `test_busy_timeout.py`,
+`test_crash_during_contention.py`, and `test_stress.py`, plus a shared
+`helpers.py` of real-multiprocess worker functions (every worker is a
+plain, picklable, module-level function run inside its own
+`multiprocessing.Process` under the `spawn` context, opening its own
+SQLite connection — never a sequential-call simulation of concurrency).
+See "Multiprocess concurrency model (v2.4)" above for what each test
+proves and for the live `uvicorn --workers 4` + `curl` verification
+that accompanied this suite.
 
 ## Deliberate MVP limitations
 
@@ -4170,7 +4413,16 @@ Plugin System) introduces a coherent `SensorPlugin` architecture,
 migrates IMU and GPS onto it with zero behavior change, and adds a
 third built-in Force/Torque sensor as proof — confirmed by a static test
 that zero synchronization/cleaning/QC/packaging/catalog file mentions
-"force_torque" — 1028 tests in the default suite, plus an opt-in
-`tests/load/` suite (14 tests, `pytest -m load`) exercising real memory
-measurement at up to 1,000,000-row scale, now including Force/Torque.
+"force_torque". v2.4 (Multiprocess Concurrency & SQLite Safety) makes
+the catalog safe under multiple concurrent local processes sharing one
+`catalog.db` — WAL journaling (verified, not assumed), a bounded busy
+timeout with a structured `CatalogBusyError`, race-safe (DB-constraint-
+authoritative) artifact/edge/dataset/version registration, and an
+OS-level exclusive rebuild lock — verified with a real multiprocess test
+suite and live `uvicorn --workers 4` + `curl` demos, including a real
+`SIGKILL` mid-write and a subsequent clean `PRAGMA integrity_check`.
+1028 tests in the default suite, plus an opt-in `tests/load/` suite (14
+tests, `pytest -m load`) exercising real memory measurement at up to
+1,000,000-row scale, plus an opt-in `tests/concurrency/` suite (18
+tests, `pytest -m concurrency`) exercising real multiprocess contention.
 No Step 11 work has been started or planned as part of this build.

@@ -278,6 +278,7 @@ v2 development:
 - v2.1 Crash Safety & Atomic Artifacts — COMPLETE
 - v2.2 Large-scale Streaming & Resource Bounds — COMPLETE
 - v2.3 Sensor / Schema Plugin System — COMPLETE
+- v2.4 Multiprocess Concurrency & SQLite Safety — COMPLETE
 
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
@@ -296,6 +297,15 @@ plugin package and one registration line, with zero changes to synchronization, 
 QC, packaging, or catalog code (verified by an automated source-text check). See
 [docs/ADDING_SENSOR.md](docs/ADDING_SENSOR.md) for the practical guide, or
 [Full Technical Guide § Sensor plugin architecture](docs/DETAILED_GUIDE.md#sensor-plugin-architecture-v23) for the design.
+
+**v2.4 (Multiprocess Concurrency & SQLite Safety)** makes the catalog safe when several
+local processes on the same machine — multiple `uvicorn` workers, concurrent pipeline
+requests, independent scripts — share one workspace and one `catalog.db`: verified WAL
+journaling, a bounded busy timeout with a structured error, race-safe (database-constraint-
+authoritative) artifact/dataset/version registration, and an OS-level exclusive rebuild lock.
+This is single-machine, multiprocess-safe local catalog access — not a distributed or
+cross-machine database. Details:
+[Full Technical Guide § Multiprocess concurrency model](docs/DETAILED_GUIDE.md#multiprocess-concurrency-model-v24).
 
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,

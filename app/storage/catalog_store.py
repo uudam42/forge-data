@@ -14,15 +14,29 @@ app.catalog.repository.CatalogRepository.rebuild_artifact_index.
 
 Uses stdlib `sqlite3` only — no ORM — to avoid unnecessary dependency
 weight for an MVP metadata index. Foreign keys are enabled explicitly
-(off by default in SQLite). This is a single-process, local-filesystem
-design: no distributed locking, no multi-writer coordination beyond
-SQLite's own transaction semantics.
+(off by default in SQLite).
+
+Concurrency model (v2.4): this remains local-first, no distributed
+locking, no cross-machine coordination — but it is explicitly
+MULTIPROCESS-SAFE for concurrent local processes sharing one
+`catalog.db` (multiple `uvicorn` workers, concurrent pipeline requests,
+independent scripts). Every process opens its OWN connection (never
+shared across processes, never a long-lived module-global); every
+connection gets WAL journaling (verified, not assumed — see
+`get_connection()`) and a bounded busy timeout, so SQLite's own reader/
+writer semantics handle concurrent access predictably instead of a raw
+"database is locked" exception ever reaching a caller. See
+docs/DETAILED_GUIDE.md#multiprocess-concurrency-model-v24.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
+
+DEFAULT_BUSY_TIMEOUT_MS = 5000
+DEFAULT_JOURNAL_MODE = "WAL"
 
 CATALOG_SCHEMA_VERSION = "1.0.0"
 
@@ -100,12 +114,73 @@ CREATE TABLE IF NOT EXISTS catalog_metadata (
 """
 
 
-def get_connection(db_path: Path) -> sqlite3.Connection:
-    """Opens (creating if needed) the catalog database with foreign keys
-    enabled and the schema applied. Callers manage their own transactions
-    explicitly (`isolation_level=None` — autocommit off, manual
-    BEGIN/COMMIT/ROLLBACK) so a multi-statement registration (an artifact
-    plus its edges) can be committed or rolled back as one unit."""
+class JournalModeNotAppliedError(Exception):
+    """Raised when the requested journal_mode could not be verified —
+    e.g. WAL requires a real filesystem that supports shared memory
+    (mmap); some network filesystems silently refuse it. Fail loudly
+    rather than silently running without the concurrency guarantees the
+    rest of v2.4 assumes."""
+
+
+_JOURNAL_MODE_RETRY_ATTEMPTS = 10
+_JOURNAL_MODE_RETRY_BASE_DELAY_S = 0.02
+
+
+def _set_journal_mode_with_retry(conn: sqlite3.Connection, journal_mode: str, db_path: Path) -> str:
+    """`PRAGMA journal_mode = WAL`, the FIRST time it runs against a given
+    database file, briefly needs exclusive access to rewrite the file
+    header. SQLite's own `busy_timeout` PRAGMA does not reliably cover
+    this one-time switch -- observed directly: two processes opening a
+    brand-new catalog.db at the same instant can each get "database is
+    locked" from this specific statement even with busy_timeout already
+    configured on the connection. Every connection after the first sees
+    the mode already applied and never takes this path at all.
+
+    This is a bounded retry, not the unbounded/hidden kind Design
+    Requirement 32 forbids: a fixed, small number of short sleeps,
+    capped well under a second in the worst case, and it only ever
+    retries "database is locked"/"database is busy" -- anything else
+    propagates immediately."""
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(_JOURNAL_MODE_RETRY_ATTEMPTS):
+        try:
+            return conn.execute(f"PRAGMA journal_mode = {journal_mode}").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            last_exc = exc
+            time.sleep(_JOURNAL_MODE_RETRY_BASE_DELAY_S * (attempt + 1))
+    raise last_exc  # pragma: no cover -- exhausting 10 bounded retries needs pathological contention
+
+
+def get_connection(
+    db_path: Path,
+    *,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    journal_mode: str = DEFAULT_JOURNAL_MODE,
+) -> sqlite3.Connection:
+    """Opens (creating if needed) the catalog database, configured for
+    concurrent multiprocess access:
+
+      - one connection per call, never shared across processes or
+        stored as a long-lived global (callers are responsible for this
+        — see app.api.routes.catalog.get_catalog_service, which already
+        opens one fresh connection per request)
+      - WAL journaling by default, VERIFIED via the PRAGMA's own return
+        value rather than assumed (see JournalModeNotAppliedError)
+      - a bounded busy_timeout, so a writer blocked behind another
+        writer waits up to this long before SQLite raises "database is
+        locked" -- CatalogRepository.transaction() catches that and
+        raises a structured CatalogBusyError, never a raw
+        sqlite3.OperationalError
+      - foreign keys enabled (off by default in SQLite)
+
+    Callers manage their own transactions explicitly (`isolation_level=
+    None` — autocommit off, manual BEGIN/COMMIT/ROLLBACK) so a
+    multi-statement registration (an artifact plus its edges) commits or
+    rolls back as one unit.
+    """
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: FastAPI resolves a sync dependency (this
@@ -116,15 +191,39 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+
+    if journal_mode:
+        applied = _set_journal_mode_with_retry(conn, journal_mode, db_path)
+        if applied.lower() != journal_mode.lower():
+            raise JournalModeNotAppliedError(
+                f"Requested journal_mode={journal_mode!r} but SQLite reports {applied!r} "
+                f"for {db_path} — the filesystem hosting the catalog may not support it "
+                f"(e.g. some network filesystems reject WAL's shared-memory file)."
+            )
+
     init_schema(conn)
     return conn
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
-    row = conn.execute("SELECT value FROM catalog_metadata WHERE key = 'catalog_schema_version'").fetchone()
+    # A cheap read first (never blocks on a concurrent writer under WAL)
+    # so that every connection opened AFTER the schema-version row has
+    # already been seeded -- i.e. virtually every connection, in every
+    # long-running process -- never attempts a write here at all. Only
+    # the very first connection(s) ever opened against a brand-new
+    # catalog.db reach the INSERT below.
+    row = conn.execute("SELECT 1 FROM catalog_metadata WHERE key = 'catalog_schema_version'").fetchone()
     if row is None:
+        # Race-safe even so: ON CONFLICT DO NOTHING instead of trusting
+        # the SELECT above, so two processes opening a brand-new
+        # catalog.db at the same instant never raise a raw
+        # IntegrityError racing to seed this row -- every writer would
+        # insert the exact same CATALOG_SCHEMA_VERSION value anyway, so
+        # "first one wins, everyone else is a no-op" is always correct.
         conn.execute(
-            "INSERT INTO catalog_metadata (key, value) VALUES ('catalog_schema_version', ?)",
+            "INSERT INTO catalog_metadata (key, value) VALUES ('catalog_schema_version', ?) "
+            "ON CONFLICT(key) DO NOTHING",
             (CATALOG_SCHEMA_VERSION,),
         )
