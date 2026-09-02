@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, _default_schema_dir, get_settings
 from app.main import app
 from app.runs.repository import RunRepository
 from tests.v26_helpers import DEFAULT_CONFIG
@@ -56,7 +56,7 @@ def test_progress_db_write_count_is_bounded_independent_of_row_count(tmp_path: P
     _generate_gps_csv(gps_path, ROW_COUNT)
 
     settings = Settings(
-        RAW_STORAGE_ROOT=tmp_path / "raw", MAX_UPLOAD_SIZE_MB=100, SCHEMA_DIR=Path(__file__).resolve().parent.parent.parent / "schemas",
+        RAW_STORAGE_ROOT=tmp_path / "raw", MAX_UPLOAD_SIZE_MB=100, SCHEMA_DIR=_default_schema_dir(),
         VALIDATION_STORAGE_ROOT=tmp_path / "validation", INTEGRITY_STORAGE_ROOT=tmp_path / "integrity",
         NORMALIZED_STORAGE_ROOT=tmp_path / "normalized", SYNCHRONIZED_STORAGE_ROOT=tmp_path / "synchronized",
         CLEANED_STORAGE_ROOT=tmp_path / "cleaned", TRANSFORMED_STORAGE_ROOT=tmp_path / "transformed",

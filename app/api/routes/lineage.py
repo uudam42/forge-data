@@ -29,8 +29,14 @@ async def get_lineage(
         return service.lineage(artifact_type, artifact_id, direction=direction, max_depth=max_depth)
     except InvalidArtifactTypeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except ArtifactNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ArtifactNotFoundError:
+        # v2.7: see app.api.routes.catalog.verify_artifact -- same
+        # scan-once-and-retry pattern for a not-yet-indexed artifact.
+        service.scan()
+        try:
+            return service.lineage(artifact_type, artifact_id, direction=direction, max_depth=max_depth)
+        except ArtifactNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
 @router.get("/{artifact_type}/{artifact_id}/impact", response_model=ImpactResponse, status_code=status.HTTP_200_OK)

@@ -31,7 +31,7 @@ from app.catalog.repository import CatalogRepository
 from app.catalog.scanner import CatalogScanner
 from app.catalog.service import CatalogService
 from app.catalog.verifier import ArtifactVerifier
-from app.core.config import Settings
+from app.core.config import Settings, _default_schema_dir
 from app.storage.catalog_store import get_connection
 
 # Real, separate OS processes on every platform this runs on (macOS/Linux
@@ -47,7 +47,7 @@ def settings_for(data_root: str, *, busy_timeout_ms: int = 5000) -> Settings:
     root = Path(data_root)
     return Settings(
         RAW_STORAGE_ROOT=root / "raw",
-        SCHEMA_DIR=Path(__file__).resolve().parent.parent.parent / "schemas",
+        SCHEMA_DIR=_default_schema_dir(),
         VALIDATION_STORAGE_ROOT=root / "validation",
         INTEGRITY_STORAGE_ROOT=root / "integrity",
         NORMALIZED_STORAGE_ROOT=root / "normalized",

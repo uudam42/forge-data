@@ -16,7 +16,7 @@ capability (open an issue), not that your sensor is unusual.
 ## Checklist
 
 - [ ] 1. Define sensor metadata
-- [ ] 2. Define the schema (`schemas/<sensor_type>_v1.json`)
+- [ ] 2. Define the schema (`app/resources/schemas/<sensor_type>_v1.json`)
 - [ ] 3. Define integrity rules
 - [ ] 4. Define canonical units
 - [ ] 5. Define the normalization profile
@@ -37,8 +37,8 @@ feature-extractor key; one identity, everywhere). For Force/Torque:
 
 ### 2. Define the schema
 
-Add `schemas/force_torque_v1.json` — the same JSON shape every existing
-schema uses (see `schemas/imu_v1.json` for reference):
+Add `app/resources/schemas/force_torque_v1.json` — the same JSON shape every existing
+schema uses (see `app/resources/schemas/imu_v1.json` for reference):
 
 ```json
 {
@@ -62,7 +62,7 @@ schema uses (see `schemas/imu_v1.json` for reference):
 
 This alone makes CSV/JSONL structural validation and integrity checking
 *work* for your sensor — `SchemaRegistry` loads every `.json` file under
-`schemas/` automatically; nothing else needs to know this file exists
+`app/resources/schemas/` automatically; nothing else needs to know this file exists
 yet.
 
 **Boundary to respect**: only structural correctness belongs here

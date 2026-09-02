@@ -25,3 +25,13 @@ data/packages/*
 data/catalog/*
 !data/catalog/.gitkeep
 .DS_Store
+app/web/dist/*
+!app/web/dist/.gitkeep
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+dist/
+build/
+*.egg-info/
+.forge-workspace-cache/
+

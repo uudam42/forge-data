@@ -38,6 +38,19 @@ from app.sensors.registry import SensorPluginRegistry, get_default_registry
 logger = logging.getLogger("app.runs.executor")
 
 
+def plan_stages(sensor_types: list[str]) -> list[str]:
+    """The ordered list of stage names one PipelineRun performs for a
+    given set of streams -- four per-stream stages followed by five
+    shared downstream stages. Pulled out of `PipelineRunner.execute` so
+    `forge run --dry-run` (v2.7) can show a run's real planned stage list
+    without duplicating this ordering by hand."""
+    planned: list[str] = []
+    for sensor_type in sensor_types:
+        planned += [f"ingestion:{sensor_type}", f"validation:{sensor_type}", f"integrity:{sensor_type}", f"normalization:{sensor_type}"]
+    planned += ["synchronization", "cleaning", "transformation", "qc", "package"]
+    return planned
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -174,10 +187,7 @@ class PipelineRunner:
         # the first version of this executor left session_id unset per
         # stream and every multi-stream run failed at synchronization).
         session_id = request.session_id or f"sess_{uuid.uuid4().hex}"
-        planned_stages: list[str] = []
-        for f in stream_files:
-            planned_stages += [f"ingestion:{f.sensor_type}", f"validation:{f.sensor_type}", f"integrity:{f.sensor_type}", f"normalization:{f.sensor_type}"]
-        planned_stages += ["synchronization", "cleaning", "transformation", "qc", "package"]
+        planned_stages = plan_stages([f.sensor_type for f in stream_files])
         self._create_all_stage_runs(run_id, planned_stages)
 
         remaining = list(planned_stages)

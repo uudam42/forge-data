@@ -16,9 +16,10 @@ from app.transformation.windowing import iter_count_windows
 from app.validation.schemas.registry import SchemaRegistry
 from app.validation.validators.base import ErrorAccumulator
 from app.validation.validators.csv_validator import CsvValidator
+from app.core.config import _default_schema_dir
 from tests.load.memory_utils import format_bytes, measure_peak_rss
 
-_SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "schemas"
+_SCHEMA_DIR = _default_schema_dir()
 _BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 

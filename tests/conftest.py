@@ -22,8 +22,15 @@ def storage_root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def schema_dir() -> Path:
-    """The project's real built-in schemas — read-only in tests."""
-    return Path(__file__).resolve().parent.parent / "schemas"
+    """The project's real built-in schemas — read-only in tests.
+
+    Resolved the same way the application itself resolves them
+    (`app.core.config._default_schema_dir`), so tests exercise the real
+    packaged-resource lookup rather than a test-only shortcut.
+    """
+    from app.core.config import _default_schema_dir
+
+    return _default_schema_dir()
 
 
 @pytest.fixture

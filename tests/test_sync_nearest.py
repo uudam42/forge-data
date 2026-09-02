@@ -9,8 +9,9 @@ import pytest
 from app.synchronization.strategies.base import AlignmentContext, StreamCursor
 from app.synchronization.strategies.nearest import NearestAlignmentStrategy
 from app.validation.schemas.registry import SchemaRegistry
+from app.core.config import _default_schema_dir
 
-SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas"
+SCHEMA_DIR = _default_schema_dir()
 
 
 @pytest.fixture

@@ -7,9 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from app.core.config import _default_schema_dir
 from app.validation.schemas.registry import DuplicateSchemaError, SchemaNotFoundError, SchemaRegistry
 
-REAL_SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas"
+REAL_SCHEMA_DIR = _default_schema_dir()
 
 
 def test_registry_loads_builtin_imu_schema() -> None:

@@ -25,12 +25,17 @@ import tempfile
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import ValidationError
 
+from app.api.routes.catalog import get_catalog_service
+from app.catalog.repository import CatalogRepository
+from app.catalog.service import CatalogService
 from app.core.config import Settings, get_settings
 from app.runs.errors import InvalidPipelineConfigError, RunCapacityExceededError, RunNotFoundError
 from app.runs.executor import StreamFile
 from app.runs.local_executor import LocalRunExecutor
 from app.runs.models import PipelineRunRequest, PipelineRunResponse, RunEventResponse, RunListResponse
 from app.runs.repository import RunRepository
+from app.runs.results import RunResultsService
+from app.runs.results_models import RunResultsResponse
 from app.runs.service import RunService
 from app.storage.catalog_store import get_connection
 
@@ -41,6 +46,14 @@ def get_run_service(settings: Settings = Depends(get_settings)) -> RunService:
     conn = get_connection(settings.CATALOG_DB_PATH, busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS, journal_mode=settings.CATALOG_JOURNAL_MODE)
     repo = RunRepository(conn, db_path=str(settings.CATALOG_DB_PATH), busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS)
     return RunService(repo=repo, settings=settings)
+
+
+def get_run_results_service(
+    settings: Settings = Depends(get_settings), catalog_service: CatalogService = Depends(get_catalog_service)
+) -> RunResultsService:
+    conn = get_connection(settings.CATALOG_DB_PATH, busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS, journal_mode=settings.CATALOG_JOURNAL_MODE)
+    catalog_repo = CatalogRepository(conn, db_path=str(settings.CATALOG_DB_PATH), busy_timeout_ms=settings.CATALOG_BUSY_TIMEOUT_MS)
+    return RunResultsService(catalog_repo=catalog_repo, catalog_service=catalog_service)
 
 
 @router.post("", response_model=PipelineRunResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -124,6 +137,25 @@ async def get_run_events(run_id: str, run_service: RunService = Depends(get_run_
         return run_service.get_events(run_id)
     except RunNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/{run_id}/results", response_model=RunResultsResponse, status_code=status.HTTP_200_OK)
+async def get_run_results(
+    run_id: str,
+    run_service: RunService = Depends(get_run_service),
+    results_service: RunResultsService = Depends(get_run_results_service),
+) -> RunResultsResponse:
+    """Resolves this run's final package/QC/split/lineage summary (v2.7,
+    Design Requirement 32). Read-only: never re-runs or mutates anything.
+    A run with no `package` artifact (still running, failed, cancelled,
+    or a non-pipeline run_type) returns a response with every optional
+    field null/empty rather than a 404 -- the run itself is real even
+    when it produced no result yet."""
+    try:
+        run = run_service.get_run(run_id)
+    except RunNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return results_service.get_results(run)
 
 
 @router.post("/{run_id}/cancel", response_model=PipelineRunResponse, status_code=status.HTTP_200_OK)

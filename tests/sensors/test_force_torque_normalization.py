@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.core.config import _default_schema_dir
+
 from fastapi.testclient import TestClient
 
 FT_CSV = (
@@ -106,7 +108,7 @@ def test_alias_mapping_fx_fy_fz_tx_ty_tz() -> None:
     from app.normalization.profiles.base import RecordNormalizer
     from app.validation.schemas.registry import SchemaRegistry
 
-    schema = SchemaRegistry(Path(__file__).resolve().parent.parent.parent / "schemas").get(
+    schema = SchemaRegistry(_default_schema_dir()).get(
         schema_name="force_torque", schema_version="1.0.0"
     )
     normalizer = RecordNormalizer(schema=schema, profile=FORCE_TORQUE_CANONICAL_V1, source_units={"force": "N", "torque": "N*m"})
@@ -126,7 +128,7 @@ def test_alias_collision_fails_loudly() -> None:
     from app.validation.schemas.registry import SchemaRegistry
     import pytest
 
-    schema = SchemaRegistry(Path(__file__).resolve().parent.parent.parent / "schemas").get(
+    schema = SchemaRegistry(_default_schema_dir()).get(
         schema_name="force_torque", schema_version="1.0.0"
     )
     normalizer = RecordNormalizer(schema=schema, profile=FORCE_TORQUE_CANONICAL_V1, source_units={"force": "N", "torque": "N*m"})

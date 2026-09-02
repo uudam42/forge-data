@@ -84,8 +84,8 @@ async def register_version(
     allow_deprecated: bool = Query(default=False, description="Allow a package with a deprecated artifact/ancestor. Never bypasses an INVALID artifact/ancestor."),
     service: CatalogService = Depends(get_catalog_service),
 ) -> DatasetVersionResponse:
-    try:
-        result, created = service.register_version(
+    def _register():
+        return service.register_version(
             dataset_name,
             version=request.version,
             package_id=request.package_id,
@@ -93,10 +93,20 @@ async def register_version(
             tags=request.tags,
             allow_deprecated=allow_deprecated,
         )
+
+    try:
+        result, created = _register()
     except DatasetNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except PackageNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except PackageNotFoundError:
+        # v2.7: see app.api.routes.catalog.verify_artifact -- same
+        # scan-once-and-retry pattern for a not-yet-indexed package (e.g.
+        # from a just-completed PipelineRun).
+        service.scan()
+        try:
+            result, created = _register()
+        except PackageNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except InvalidDatasetVersionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except PackageNotAcceptedError as exc:

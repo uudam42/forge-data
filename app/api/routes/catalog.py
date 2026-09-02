@@ -146,8 +146,17 @@ async def verify_artifact(
         return service.verify(artifact_type, artifact_id, recursive=recursive)
     except InvalidArtifactTypeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except ArtifactNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ArtifactNotFoundError:
+        # v2.7: the artifact index is populated by an explicit scan, not
+        # written live by each stage service -- a real, just-produced
+        # artifact (e.g. from a just-completed PipelineRun) can
+        # legitimately not be indexed yet. Scan once and retry before
+        # reporting 404, mirroring app.runs.results's same pattern.
+        service.scan()
+        try:
+            return service.verify(artifact_type, artifact_id, recursive=recursive)
+        except ArtifactNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

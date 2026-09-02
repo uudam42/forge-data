@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import importlib.resources
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes.catalog import router as catalog_router
 from app.api.routes.cleaning import router as cleaning_router
@@ -11,6 +16,7 @@ from app.api.routes.ingestion import router as ingestion_router
 from app.api.routes.integrity import router as integrity_router
 from app.api.routes.lineage import router as lineage_router
 from app.api.routes.normalization import router as normalization_router
+from app.api.routes.packages import router as packages_router
 from app.api.routes.packaging import router as packaging_router
 from app.api.routes.qc import router as qc_router
 from app.api.routes.rebuild import router as rebuild_router
@@ -26,6 +32,7 @@ from app.ingestion.models import HealthResponse
 from app.runs.recovery import RunRecoveryService
 from app.runs.repository import RunRepository
 from app.storage.catalog_store import get_connection
+from app.version import __version__
 
 settings = get_settings()
 configure_logging(settings.LOG_LEVEL)
@@ -43,7 +50,7 @@ app = FastAPI(
         "v2.1 adds crash-safe, atomically-published artifacts and a staging recovery service "
         "across every stage's storage layer — a cross-cutting reliability upgrade, not a new stage."
     ),
-    version="0.10.0",
+    version=__version__,
 )
 
 app.include_router(ingestion_router)
@@ -62,6 +69,7 @@ app.include_router(recovery_router)
 app.include_router(sensors_router)
 app.include_router(rebuild_router)
 app.include_router(runs_router)
+app.include_router(packages_router)
 
 
 @app.on_event("startup")
@@ -94,3 +102,31 @@ def _reconcile_stale_runs() -> None:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+# ---------------------------------------------------------------------------
+# Local GUI static serving (v2.7). `app/web/dist/` holds the built React/
+# Vite production output -- present in an installed wheel (packaged via
+# `[tool.setuptools.package-data]`), absent in a plain source checkout that
+# never ran the frontend build. Registered LAST so every `/api/v1/*` route
+# above always wins the match; only a path Starlette couldn't otherwise
+# resolve reaches the SPA fallback, and `full_path.startswith("api/")` is a
+# second, explicit guard against ever serving `index.html` for an API path.
+# ---------------------------------------------------------------------------
+
+_WEB_DIST = Path(str(importlib.resources.files("app.web"))) / "dist"
+_WEB_INDEX = _WEB_DIST / "index.html"
+
+if _WEB_INDEX.is_file():
+    _assets_dir = _WEB_DIST / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="frontend-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str) -> FileResponse:
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        candidate = _WEB_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(_WEB_INDEX))

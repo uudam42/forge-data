@@ -160,6 +160,26 @@ curl -X POST http://localhost:8000/api/v1/ingestion/upload \
 
 The full 10-stage curl walkthrough is in the [Full Technical Guide](docs/DETAILED_GUIDE.md).
 
+### Product quick start (CLI + local GUI)
+
+The 10-stage API above is what the pipeline runs on; you don't have to
+call it by hand. v2.7 adds a `forge` CLI and a local browser GUI on top
+of it — install (or `pip install -e .` from this checkout), then:
+
+```bash
+forge init demo && cd demo
+forge run pipelines/example.yaml     # or: forge serve, then open http://127.0.0.1:8000
+```
+
+`forge serve` starts the API and a local GUI (Dashboard, New Run, Run
+Detail, a Results Explorer, Datasets, Lineage) at `http://127.0.0.1:8000` —
+local-process execution with durable run metadata, not a distributed job
+queue. From there you can start a pipeline run, watch it progress, cancel
+it if needed, and inspect the final package, QC report, and lineage
+without touching the filesystem or Swagger UI directly. Full CLI command
+reference: [docs/CLI.md](docs/CLI.md); architecture:
+[docs/DETAILED_GUIDE.md#local-cli-and-gui-v27](docs/DETAILED_GUIDE.md#local-cli-and-gui-v27).
+
 ## API surface
 
 | Group | Prefix | Purpose |
@@ -228,20 +248,25 @@ robotics_demo @ 1.0.0
 
 ## Testing
 
-1028 tests currently cover per-stage behavior, lineage gates, determinism, artifact
+1139 tests currently cover per-stage behavior, lineage gates, determinism, artifact
 immutability, checksum validation, API contracts, crash-safety/atomic-commit
 guarantees (including real subprocess kill tests), sensor plugin contracts (IMU, GPS,
-Force/Torque), and full end-to-end pipeline runs.
+Force/Torque), pipeline runs/cancellation, and the `forge` CLI, plus full end-to-end
+pipeline runs.
 
 ```bash
 pytest
 ```
 
-An additional opt-in `tests/load/` suite (14 tests, deselected by default) exercises real
-memory measurement at up to 1,000,000-row scale:
+An additional opt-in `tests/load/` suite (15 tests, deselected by default) exercises real
+memory measurement at up to 1,000,000-row scale, an opt-in `tests/concurrency/` suite
+(26 tests) exercises real multiprocess contention, and a separate frontend suite
+(21 tests, Vitest) covers the GUI:
 
 ```bash
 pytest -m load
+pytest -m concurrency
+cd frontend && npm test
 ```
 
 ## Project structure
@@ -255,8 +280,12 @@ app/
   catalog/            Lineage graph, verification, dataset registry, SQLite catalog
   storage/            Immutable artifact stores (one per stage) + catalog store
   api/routes/         FastAPI routers, one per stage
-tests/                1028 tests (+ opt-in tests/load/, 14 tests, `pytest -m load`)
-schemas/              Built-in IMU / GPS / Force-Torque schema definitions
+  runs/               PipelineRun/StageRun execution model, progress, cancellation (v2.6)
+  cli/                `forge` CLI commands (v2.7)
+  web/                Built frontend, bundled as package data (v2.7)
+frontend/             React/TypeScript/Vite GUI source (v2.7)
+tests/                1139 tests (+ opt-in tests/load/, 15, and tests/concurrency/, 26)
+app/resources/schemas/   Built-in IMU / GPS / Force-Torque schema definitions (bundled package resource)
 docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
 docs/ADDING_SENSOR.md   Step-by-step guide to adding a new sensor plugin
 ```
@@ -281,6 +310,7 @@ v2 development:
 - v2.4 Multiprocess Concurrency & SQLite Safety — COMPLETE
 - v2.5 Data Governance & Selective Rebuild — COMPLETE
 - v2.6 Pipeline Runs, Progress, Cancellation & Observability — COMPLETE
+- v2.7 Local CLI, GUI, Results Explorer & Distribution — COMPLETE
 
 **v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
 of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
@@ -329,6 +359,16 @@ resume. This is local-process execution with durable run metadata, not a distrib
 queue. Details:
 [Full Technical Guide § Pipeline runs and observability](docs/DETAILED_GUIDE.md#pipeline-runs-and-observability-v26).
 
+**v2.7 (Local CLI, GUI, Results Explorer & Distribution)** turns the platform into an
+installable product: a `forge` CLI, a local browser GUI served by the existing FastAPI
+app, a Results Explorer that resolves a completed run's package/QC/splits/lineage
+without ever reading split-file contents, and a wheel whose schemas and built frontend
+are bundled inside the package so they work identically from a source checkout and an
+installed wheel run from anywhere. This is local-process execution with durable run
+metadata, not a distributed job queue. Details:
+[Full Technical Guide § Local CLI and GUI](docs/DETAILED_GUIDE.md#local-cli-and-gui-v27) ·
+[CLI command reference](docs/CLI.md).
+
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,
 authentication, multi-tenancy, and a web dashboard are planned for the next phase — see
@@ -347,8 +387,7 @@ authentication, multi-tenancy, and a web dashboard are planned for the next phas
 **Deliberately not implemented yet:**
 - Cloud object storage backends (S3 / GCS / Azure Blob)
 - Authentication, authorization, or multi-tenancy
-- Distributed or orchestrated execution
-- A web dashboard
+- Distributed or orchestrated (multi-machine) execution
 - Automatic sensor schema inference
 - A production-grade (non-SQLite) database deployment
 
@@ -357,15 +396,14 @@ authentication, multi-tenancy, and a web dashboard are planned for the next phas
 Realistic next steps, not commitments or dates:
 
 - Pluggable cloud storage backends
-- Pipeline job orchestration and run history
 - Authentication and workspace isolation
-- A web dashboard over the catalog and lineage graph
 - Richer robotics connectors (e.g. ROS bag ingestion)
 - Production observability (metrics, structured tracing)
 
 ## Documentation
 
 - [Full Technical Guide](docs/DETAILED_GUIDE.md) — architecture, every API and error code, per-stage design notes, MVP limitations
+- [CLI reference](docs/CLI.md) — every `forge` command
 - [Adding a Sensor](docs/ADDING_SENSOR.md) — step-by-step guide to adding a new sensor plugin
 - [中文文档](README.zh-CN.md)
 

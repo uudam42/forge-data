@@ -6,10 +6,24 @@ reads os.environ directly and never hardcodes storage paths.
 
 from __future__ import annotations
 
+import importlib.resources
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_schema_dir() -> Path:
+    """Resolve the bundled sensor schema directory via `importlib.resources`.
+
+    Schemas live inside the `app.resources` package (not a repo-root
+    `schemas/` directory) specifically so this resolves correctly both
+    from a source checkout and from an installed wheel run from an
+    arbitrary cwd -- an installed console script has no repository
+    checkout nearby to find a cwd-relative path against.
+    """
+    return Path(str(importlib.resources.files("app.resources") / "schemas"))
 
 
 class Settings(BaseSettings):
@@ -25,8 +39,10 @@ class Settings(BaseSettings):
     # Extensions accepted by the ingestion endpoint (lowercase, with dot).
     ALLOWED_EXTENSIONS: tuple[str, ...] = (".csv", ".json", ".jsonl", ".zip")
 
-    # Directory of schema-definition JSON files (Step 2).
-    SCHEMA_DIR: Path = Path("schemas")
+    # Directory of schema-definition JSON files (Step 2). Bundled inside
+    # the installed package (see `_default_schema_dir`) so it resolves
+    # correctly for an installed wheel, not just a source checkout.
+    SCHEMA_DIR: Path = Field(default_factory=_default_schema_dir)
 
     # Root directory for validation reports, kept separate from raw storage.
     VALIDATION_STORAGE_ROOT: Path = Path("data/validation")
@@ -174,7 +190,7 @@ class Settings(BaseSettings):
     # structured LOCAL_RUN_CAPACITY_EXCEEDED error -- there is no queue.
     MAX_LOCAL_PIPELINE_RUNS: int = 2
 
-    APP_NAME: str = "ai-data-pipeline"
+    APP_NAME: str = "forge-data"
     LOG_LEVEL: str = "INFO"
 
     @property

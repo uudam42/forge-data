@@ -147,8 +147,12 @@ class RunRepository:
         return dict(row) if row is not None else None
 
     def list_stage_runs(self, run_id: str) -> list[dict]:
+        # ORDER BY rowid (not stage_run_id, a UUID with no relation to
+        # insertion order) so stages come back in the order
+        # `_create_all_stage_runs` created them -- real execution order,
+        # not lexicographic UUID order.
         rows = self._conn.execute(
-            "SELECT * FROM pipeline_stage_runs WHERE run_id = ? ORDER BY stage_run_id", (run_id,)
+            "SELECT * FROM pipeline_stage_runs WHERE run_id = ? ORDER BY rowid", (run_id,)
         ).fetchall()
         return [dict(r) for r in rows]
 

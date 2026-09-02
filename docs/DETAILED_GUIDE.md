@@ -31,6 +31,7 @@ v2.3    Sensor / Schema Plugin System (cross-cutting, not a stage) COMPLETE
 v2.4    Multiprocess Concurrency + SQLite Safety (cross-cutting, not a stage) COMPLETE
 v2.5    Data Governance + Selective Rebuild (cross-cutting, not a stage) COMPLETE
 v2.6    Pipeline Runs, Progress, Cancellation + Observability (cross-cutting, not a stage) COMPLETE
+v2.7    Local CLI, GUI, Results Explorer + Distribution (cross-cutting, not a stage) COMPLETE
 ```
 
 No Step 11 work has been started.
@@ -173,9 +174,10 @@ app/validation/
         jsonl_validator.py       One record per line, streaming
     schemas/
         base.py                  SchemaDefinition / FieldDefinition (the schema format)
-        registry.py              SchemaRegistry — loads schemas/*.json, lookup by name+version
+        registry.py              SchemaRegistry — loads schema JSON files, lookup by name+version
 
-schemas/                      Built-in schema definitions (imu_v1.json, gps_v1.json)
+app/resources/schemas/                      Built-in schema definitions (imu_v1.json, gps_v1.json) — bundled
+                                package resource (v2.7), not a repo-root directory
 data/validation/               Persisted validation reports (separate from data/raw/)
 ```
 
@@ -185,7 +187,7 @@ field name — `RecordEvaluator` (in `validators/base.py`) checks any
 `json_validator.py` / `jsonl_validator.py` differ only in how they turn a
 file into `(index, record)` pairs. Adding a new schema (GPS, camera
 metadata, force/torque, joint-state, a customer-defined schema) means
-dropping a new JSON file into `schemas/` — no engine code changes.
+dropping a new JSON file into `app/resources/schemas/` — no engine code changes.
 
 `RawStorage` gained two read-only methods to support this without touching
 any write path: `find_manifest(ingestion_id)` (locate an ingestion by ID
@@ -269,11 +271,11 @@ Field types: `string`, `integer`, `float`, `boolean`, `datetime`.
 
 ### Built-in schemas
 
-**`schemas/imu_v1.json`** — `imu` v`1.0.0`
+**`app/resources/schemas/imu_v1.json`** — `imu` v`1.0.0`
 Required: `timestamp`, `accel_x`, `accel_y`, `accel_z`.
 Optional: `gyro_x`, `gyro_y`, `gyro_z`, `device_id`.
 
-**`schemas/gps_v1.json`** — `gps` v`1.0.0`
+**`app/resources/schemas/gps_v1.json`** — `gps` v`1.0.0`
 Required: `timestamp`, `latitude`, `longitude`.
 Optional: `altitude`, `speed`, `device_id`.
 `latitude`/`longitude` are **type-checked only** here (`float`) — range
@@ -3509,7 +3511,7 @@ Force/Torque itself required zero further edits to that file.
 Three independent version axes already existed before v2.3 and are
 **not** duplicated by plugin versioning:
 
-- **`schema_version`** — the structural contract (`schemas/*.json`).
+- **`schema_version`** — the structural contract (`app/resources/schemas/*.json`).
   Bump when required/optional fields, types, or the schema's own shape
   change.
 - **`normalization_profile_version`** — the normalization logic/config
@@ -3560,7 +3562,7 @@ After the plugin framework existed, adding Force/Torque touched:
 
 **Force/Torque-specific files (new, 6):**
 `app/sensors/force_torque/{__init__.py,plugin.py,integrity.py,normalization.py,features.py}`,
-`schemas/force_torque_v1.json`.
+`app/resources/schemas/force_torque_v1.json`.
 
 **Generic-infrastructure files changed to support pluggability in general
 (built once, before Force/Torque existed as a concept — not
@@ -4443,7 +4445,317 @@ POST   /api/v1/runs/{run_id}/cancel idempotent; sets cancel_requested if queued/
 
 ---
 
+## Local CLI and GUI (v2.7)
+
+v2.7 turns the backend/API platform from v1–v2.6 into an installable,
+locally-usable product: a `forge` CLI, a local browser GUI, a Results
+Explorer, and a wheel that installs and runs outside the source
+checkout. Neither the CLI nor the GUI implement any pipeline, QC,
+lineage, or governance logic themselves — both are thin clients over
+the exact same application/service layer and HTTP API every earlier
+milestone already built. See `docs/CLI.md` for the full CLI command
+reference; this section covers the architecture.
+
+### Architecture
+
+```
+                 CLI (app/cli/)
+                  │
+                  ▼
+      app.runs / app.catalog / app.storage.recovery  (direct calls)
+                  ▲
+                  │
+                 GUI (frontend/, built into app/web/dist/)
+                  │
+                  ▼
+               FastAPI (app.main)
+                  │
+                  ▼
+        PipelineRun / RunService / LocalRunExecutor (v2.6)
+                  │
+                  ▼
+         existing stage services (Steps 1-10)
+```
+
+The CLI calls the application/service layer directly (constructing
+`RunService`, `CatalogService`, `RecoveryService`, etc. exactly like
+each FastAPI route's own dependency function does — see
+`app/cli/services.py`) rather than making HTTP requests to itself. The
+GUI only ever talks to the real HTTP API (`/api/v1/...`), same-origin,
+in production. Neither path duplicates a single line of stage,
+run-executor, or catalog logic.
+
+### Workspace model
+
+A Forge workspace is a directory containing a `forge.yaml` marker file
+plus a `data/` tree — not a second storage hierarchy. `forge init
+<dir>` creates it; `app.cli.workspace.build_settings_for_workspace`
+constructs a real `Settings` object pointing every existing storage
+root (`RAW_STORAGE_ROOT`, `CATALOG_DB_PATH`, ...) at
+`<workspace>/data/<stage>`, reusing the exact fields every stage
+service already reads. `SCHEMA_DIR` is deliberately left at its
+packaged-resource default (Design Requirement 50) — schemas are
+bundled application resources, never workspace-editable content.
+
+Resolution precedence (first match wins), so a workspace is never
+silently created in an arbitrary cwd:
+
+1. an explicit `--workspace <dir>`
+2. the `FORGE_WORKSPACE` environment variable
+3. the current directory, if it already contains `forge.yaml`
+4. a clear `WorkspaceNotFoundError` with guidance, otherwise
+
+`forge serve` hands its resolved workspace to the FastAPI process via
+environment variables (`app.cli.workspace.env_for_workspace`), read by
+the same `Settings` class — no second settings-injection path.
+
+### Pipeline config file
+
+A pipeline YAML/JSON config (`app/cli/pipeline_config.py`) is a pure
+serialization layer over the real `PipelineRunRequest` model from
+`app.runs.models` — every key except `streams[].path` maps directly
+onto that model's own field names and is handed to
+`PipelineRunRequest.model_validate()` unmodified, the exact same
+Pydantic validation `POST /api/v1/runs` uses. The only CLI-specific
+concept is `streams[].path`, a per-stream input file path (the HTTP API
+takes file bytes as multipart uploads instead), resolved relative to
+the **config file's own directory** — not the workspace root — so a
+config stays portable if the workspace that runs it moves.
+
+`forge config validate` checks: YAML/JSON syntax, `PipelineRunRequest`
+structure, each stream's input file existence, sensor-plugin
+registration (via the real v2.3 `SensorPluginRegistry` — never a
+hard-coded sensor list), and packaging split ratios summing to 1.0. It
+never executes a stage.
+
+`forge run <file> --dry-run` parses and validates the config, resolves
+the real stage plan via `app.runs.executor.plan_stages` (extracted from
+`PipelineRunner.execute` specifically so dry-run and real execution
+share the exact same stage-ordering logic), and prints it — no run
+record is created, no artifact is written.
+
+### Running a pipeline
+
+`forge run <file>` (no `--dry-run`) calls `RunService.create_run()` and
+`LocalRunExecutor.run()` directly — the identical v2.6 in-process
+execution path `POST /api/v1/runs`'s background task uses — on a
+background thread, while the main thread polls `RunService.get_run()`
+every 250ms to drive a live Rich terminal display (stage glyphs,
+percentage only when `progress_fraction` is genuinely known, else a
+raw `records_processed` count, matching Design Requirement 9). `--json`
+suppresses all of that and prints only the final `PipelineRunResponse`
+as JSON, for scripting. Exit codes: `0` success, `1`
+config/validation error, `2` the run itself reached `failed`/
+`cancelled`, `3` resource-not-found, `4` `forge doctor --strict`
+unhealthy.
+
+The GUI's New Run page submits to the real `POST /api/v1/runs`
+multipart endpoint and polls `GET /api/v1/runs/{id}` every 1-2 seconds
+while the run is queued/running/cancel_requested, stopping at any
+terminal state — no WebSockets. Both paths preserve v2.6's local
+capacity limit (`MAX_LOCAL_PIPELINE_RUNS`) and cooperative,
+stage-boundary cancellation semantics unchanged: a Cancel action (CLI
+`forge run cancel <id>` or the GUI's Cancel button) is idempotent,
+non-blocking, and takes effect at the next safe stage boundary, not
+instantly — the GUI's copy says so explicitly rather than implying
+immediate termination.
+
+### Results Explorer
+
+A completed run's final package, QC, splits, files, and lineage
+fingerprint were not previously resolvable without manually tracing
+`run_artifacts` rows and on-disk manifests by hand. v2.7 adds
+`GET /api/v1/runs/{run_id}/results` (`app/runs/results.py`,
+`RunResultsService`) — a read-only resolver that joins:
+
+```
+run  -->  run_artifacts (stage="package")  -->  artifacts.metadata_json
+     -->  PackageManifest  -->  (qc_id)  -->  artifacts.metadata_json
+     -->  QC manifest  -->  (report_uri)  -->  report.json on disk
+```
+
+`metadata_json` already holds each artifact's full committed
+manifest.json content (`canonical_json(manifest_data)` — see
+`app.catalog.scanner`), so this needs no new storage access pattern and
+constructs no stage-service object just to read a summary. The catalog
+index (`artifacts` table) is populated by an explicit scan, never
+written live by a stage service (true since v1) — a run_artifacts row
+can legitimately name a package the index hasn't picked up yet
+immediately after that run's packaging stage committed, so this
+resolver (and the equivalent lineage/verify/dataset-registration
+lookups used from the CLI and GUI) transparently retries once after a
+`CatalogService.scan()` before reporting not-found, rather than
+requiring the caller to separately know to scan first.
+
+The response (`RunResultsResponse`) is bounded and metadata-only by
+construction: package status/format/sample-count/local path, split
+counts, a QC summary (status, warning/error counts, per-sensor modality
+coverage, first 50 issues), a file list (name, relative path,
+**stat-based** size — never a content read to compute size), the
+lineage fingerprint, and any dataset registrations already made from
+this package. It never returns split-file contents. A run that hasn't
+produced a package (still running, failed, cancelled) returns every
+optional field `null`/empty rather than a 404 — the run itself is real
+even when it produced no result yet.
+
+The GUI's Results tab renders all of this directly, plus "Copy Path"
+(client-side clipboard, no API call) and "Open Output Folder".
+
+### Local file access policy
+
+Two separate, deliberately distinct concerns:
+
+- **Getting input data in.** A browser cannot read arbitrary local
+  files, so the New Run page uses a plain file upload
+  (`<input type="file">`) into the same multipart `POST /api/v1/runs`
+  endpoint the CLI's local-file path ultimately calls too. There is no
+  "local workspace path" option in the GUI.
+- **Getting output data out.** Split files can be many gigabytes; v2.7
+  never proxies them through FastAPI just because a Download button
+  would be convenient. Small metadata files (manifest.json,
+  report.json) are safe to note by name/size; large split files are
+  exposed only as local path + "Open Output Folder" + "Copy Path".
+
+`POST /api/v1/packages/{package_id}/open-folder`
+(`app/api/routes/packages.py`) is the one path-sensitive action the GUI
+exposes, and it is deliberately narrow:
+
+- accepts only a catalog-known `package_id` — never a client-supplied
+  path string;
+- resolves that package's directory itself, from the catalog's own
+  `manifest_uri`;
+- refuses to proceed unless the resolved, `.resolve()`d directory is
+  actually inside the configured `PACKAGE_STORAGE_ROOT`
+  (`_resolve_within_package_root`);
+- invokes the platform file-manager (`open` / `xdg-open` / `explorer`)
+  as a fixed argv list — never `shell=True`, never a string built from
+  anything client-controlled;
+- returns 501 on an unsupported platform rather than silently failing.
+
+### Dataset registration from Results
+
+"Register Dataset Version" on a completed package calls the existing
+v1/v2.5 dataset APIs unmodified: `POST /api/v1/datasets` (idempotent
+create-if-absent) then `POST /api/v1/datasets/{name}/versions`. The
+version string is always an explicit user-typed value — the GUI
+suggests `1.0.0` as a placeholder only, never auto-increments. This
+only adds catalog metadata; it never mutates the package artifact
+itself. v2.5 governance gates (`allow_deprecated`, invalid-ancestor
+rejection) remain fully enforced underneath, unchanged.
+
+### Governance display
+
+Dataset version detail (GUI and `forge dataset show`) surfaces the
+v2.5 `effective_status`/`effective_status_reason` fields directly: a
+version affected by an invalidated upstream artifact renders as
+"Affected: `<reason>`" rather than the plain `status` — the version
+itself is never hidden, deleted, or marked inactive because of this;
+its own explicit lifecycle state (`active`) is shown separately from
+its computed effective status. Editing governance (deprecate /
+invalidate / reactivate) from the GUI is out of scope for v2.7 —
+display-only.
+
+### Lineage visualization
+
+Both the CLI (`forge lineage`) and the GUI's `LineageTree` component
+render lineage as a tree by walking the returned edge list **as an
+undirected adjacency** from the queried root and recursing outward
+(guarded by a visited-set so a multi-parent join, e.g. two streams both
+feeding synchronization, is never re-descended into). This is
+deliberate: `LineageGraphResponse.edges` always stores true causal
+(parent-produces-child) direction regardless of which artifact was
+queried, and a package is a DAG sink — it is always a *child* edge,
+never a *parent* edge — so a naive parent-to-child-only tree build
+renders an **empty** tree when rooted at a package (the common "trace
+this package back to its raw ingestions" case). Both the CLI and GUI
+tree builders walk outward in both directions from the root for
+exactly this reason.
+
+### Frontend stack and static serving
+
+React + TypeScript + Vite (no Next.js, no SSR), `react-router-dom` for
+client-side routing, Vitest + React Testing Library for tests. No UI
+kit, state-management library, charting library, or DAG-editor
+library — the dependency surface is deliberately small (see
+`frontend/package.json`).
+
+The frontend source lives in `frontend/`; its production build
+(`npm run build`, or `python3 scripts/build_frontend.py`) is configured
+(`frontend/vite.config.ts`) to output directly into `app/web/dist/` —
+inside the Python package, not a repo-root directory — specifically so
+it resolves identically from a source checkout and from an installed
+wheel. `app.main` mounts `/assets` from `app/web/dist/assets` and
+registers a catch-all `GET /{full_path:path}` SPA-fallback route
+**last** (after every `/api/v1/*` router), so `/api/v1/*` always wins
+the match; the fallback also explicitly 404s any path starting with
+`api/` as a second guard, so a client typo can never accidentally
+receive `index.html` in place of a real API 404. If
+`app/web/dist/index.html` is absent (frontend never built), no static
+routes are registered at all and the backend runs fine as an API-only
+server — `forge doctor` reports this as an advisory (not a health
+failure): a plain API install is a fully supported mode.
+
+Development mode runs `npm run dev` (Vite dev server) separately, with
+`server.proxy` forwarding `/api` to `http://127.0.0.1:8000` — no
+production CORS configuration is needed, since installed usage is
+always same-origin.
+
+### Package-resource lookup
+
+Two categories of file, resolved two different ways, on purpose:
+
+- **Bundled application resources** (sensor schema JSON, the built
+  frontend) live *inside* the `app` package (`app/resources/schemas/`,
+  `app/web/dist/`) and are resolved via `importlib.resources`
+  (`app.core.config._default_schema_dir`) or a plain
+  `Path(__file__).parent`-relative lookup — never a repo-root-relative
+  path, since an installed console script has no repository checkout
+  nearby. This is what makes `forge sensors`/`forge doctor`/`forge
+  serve` work identically whether run from a source checkout or an
+  installed wheel from an arbitrary cwd.
+- **User workspace data** (`data/raw`, `data/catalog/catalog.db`, ...)
+  always lives outside the installed package, under whatever workspace
+  directory was resolved per the precedence above.
+
+### Installation model
+
+```
+[project.scripts]
+forge = "app.cli.main:main"
+```
+
+installs a real `forge` console command (`forge --help`/`--version`
+work without `python -m`). The version is read from one place
+(`app/version.py`'s `__version__`) by `pyproject.toml`'s dynamic
+version, `app.main`'s FastAPI `version=`, and `forge --version` — never
+duplicated. `[tool.setuptools.package-data]` bundles
+`app/resources/schemas/*.json` and `app/web/dist/**/*` into the wheel.
+Building a wheel does **not** run `npm` itself — build the frontend
+first (`python3 scripts/build_frontend.py`, or `cd frontend && npm ci
+&& npm run build`), then `python -m build`.
+
+### Deliberate limitations (v2.7)
+
+- No cloud storage, distributed workers, remote execution, user
+  accounts, authentication, RBAC, multi-tenancy, or team workspaces —
+  unchanged from v2.6's local-first, single-workspace-per-catalog
+  model.
+- No WebSockets/SSE — the GUI polls; this milestone did not find
+  polling insufficient at local, single-workspace scale.
+- No drag-and-drop DAG editor, no rebuild wizard, no governance-editing
+  GUI (deprecate/invalidate/reactivate remain API/CLI-only) — display
+  and execution, not administration, was this milestone's scope.
+- No bundled "system info" JSON endpoint — `forge doctor` remains the
+  authoritative combined workspace/disk/catalog-health diagnostic; the
+  GUI's System page says so honestly rather than fabricating one.
+- Desktop packaging (Electron/Tauri) is explicitly out of scope; this
+  is a local-first *browser* GUI served by Forge Data's own backend.
+
+---
+
 ## Setup
+
+Source-checkout / development:
 
 ```bash
 cd ai_data_pipeline
@@ -4452,13 +4764,25 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+Installed product usage (v2.7 — see "Local CLI and GUI (v2.7)" below):
+
+```bash
+pip install forge-data
+forge init my-workspace && cd my-workspace
+forge run pipelines/example.yaml
+forge serve   # http://127.0.0.1:8000 -- API + local GUI
+```
+
 ## Running the server
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-The API is then available at `http://localhost:8000`.
+The API is then available at `http://localhost:8000`. Equivalently, from an
+installed package or a workspace directory: `forge serve` (defaults to
+`127.0.0.1:8000`, and additionally serves the built GUI at `/` if the
+frontend has been built — see below).
 
 ## End-to-end demo
 
@@ -4520,7 +4844,7 @@ Environment variables (all optional, sensible defaults provided):
 |-----------------------------|----------------------|-------------------------------------------------|
 | `RAW_STORAGE_ROOT`          | `data/raw`           | Root directory for immutable raw storage        |
 | `MAX_UPLOAD_SIZE_MB`        | `512`                | Maximum accepted upload size                    |
-| `SCHEMA_DIR`                | `schemas`            | Directory of schema-definition JSON files       |
+| `SCHEMA_DIR`                | *(bundled `app.resources` package data, v2.7)* | Directory of schema-definition JSON files — resolved via `importlib.resources`, not a repo-root path, so it works identically from a source checkout or an installed wheel |
 | `VALIDATION_STORAGE_ROOT`   | `data/validation`    | Root directory for persisted validation reports |
 | `MAX_VALIDATION_ERRORS`     | `1000`               | Cap on detailed error objects stored per report |
 | `INTEGRITY_STORAGE_ROOT`    | `data/integrity`     | Root directory for persisted integrity reports  |
@@ -4554,6 +4878,11 @@ Environment variables (all optional, sensible defaults provided):
 | `PROGRESS_UPDATE_INTERVAL_MS` | `500.0`          | Minimum wall-clock time between real progress SQLite writes for one stage, regardless of how often progress is reported (v2.6) |
 | `MAX_LOCAL_PIPELINE_RUNS`   | `2`                  | How many pipeline/selective-rebuild runs may be `queued`/`running`/`cancel_requested` at once, across every process sharing this workspace (v2.6) |
 
+These are read directly by `Settings` (via `pydantic-settings`, env vars or
+`.env`) for the HTTP API. The `forge` CLI (v2.7) resolves them differently —
+per-workspace, via `--workspace`/`FORGE_WORKSPACE`/cwd `forge.yaml` — see
+"Local CLI and GUI (v2.7)" below and `docs/CLI.md`.
+
 ## How raw storage works
 
 - Every ingestion event gets its own directory keyed by
@@ -4585,7 +4914,10 @@ Environment variables (all optional, sensible defaults provided):
 ## Running tests
 
 ```bash
-pytest
+pytest                        # default suite (1139 tests)
+pytest -m load                 # opt-in, large-scale (15 tests)
+pytest -m concurrency          # opt-in, real multiprocess (26 tests)
+cd frontend && npm test        # frontend suite (21 tests, Vitest)
 ```
 
 878 tests total (23 Step 1 + 49 Step 2 + 44 Step 3 + 56 Step 4 + 87 Step 5
@@ -4601,7 +4933,7 @@ transformed artifacts, QC artifacts, package artifacts, and the catalog
 database, so they never touch the real `data/raw`, `data/validation`,
 `data/integrity`, `data/normalized`, `data/synchronized`, `data/cleaned`,
 `data/transformed`, `data/qc`, `data/packages`, or `data/catalog`
-directories. Step 2/3/4/5 tests do read the real, built-in `schemas/`
+directories. Step 2/3/4/5 tests do read the real, built-in `app/resources/schemas/`
 directory (read-only) to exercise the actual `imu`/`gps` definitions
 end-to-end. Step 9's optional Parquet tests are skipped cleanly
 (`pytest.importorskip`) when `pyarrow` isn't installed. Step 10's
@@ -4709,6 +5041,36 @@ history — and one more **opt-in** `tests/load/` test (15 total) in
 See "Pipeline runs and observability (v2.6)" above for the design each
 test proves, and `tests/v26_helpers.py` for the shared run-submission
 helper.
+
+v2.7 adds 38 more tests to the default suite (1139 total):
+`test_v27_cli.py` (27 — every `forge` command invoked in-process via
+Typer's `CliRunner` against real, isolated `tmp_path` workspaces:
+`--help`/`--version`, `init` idempotency/force/non-empty-directory
+rejection, workspace resolution via `--workspace`/`FORGE_WORKSPACE`/
+missing-workspace error, config-relative-path resolution, config
+validate success/failure, dry-run producing no run/artifacts, run
+success/failure with correct exit codes, `runs`/`run show`/`run
+cancel`/`run events`, `sensors`, `datasets`/`dataset register`/`dataset
+show`, `lineage`, `verify`, `recover scan`, `doctor`/`doctor --json`,
+and `serve`'s host/port argument construction with `uvicorn.run`
+mocked so no real server ever starts), `test_v27_results_api.py` (9 —
+`GET /runs/{id}/results` package/QC/splits/files/lineage-fingerprint
+resolution, the null-fields-not-404 no-package case, file sizes
+matching real on-disk `stat` rather than a content read, dataset-
+registration reflection, and `POST /packages/{id}/open-folder`
+rejecting an unknown package / never using `shell=True`), and
+`test_v27_determinism.py` (2 — a run submitted through `forge run`'s
+in-process CLI path is byte-identical, by `content_sha256`, to the same
+config/input submitted through the real HTTP API; the CLI's YAML-loaded
+`PipelineRunRequest` produces the identical `config_hash` as the
+equivalent request built directly, proving the config file is a pure
+serialization layer, never a second semantics system). A separate
+frontend suite (21 tests, Vitest + React Testing Library, run via
+`cd frontend && npm test`) covers the API client's error-detail
+formatting, stage-glyph/progress rendering, lineage-tree construction
+(including the sink-rooted-package regression case), dynamic
+sensor-dropdown population, and Dashboard/NewRun empty and loaded
+states — see `frontend/src/**/*.test.{ts,tsx}`.
 
 ## Deliberate MVP limitations
 
@@ -5115,11 +5477,37 @@ skip, a genuine mid-flight cancellation (including a real bug caught
 live — a cancellation status was being silently overwritten before it
 could take effect — fixed and regression-tested), a real `SIGKILL`
 mid-run followed by clean startup reconciliation, and a selective
-rebuild's run record.
+rebuild's run record. v2.7 (Local CLI, GUI, Results Explorer &
+Distribution) turns the platform into an installable product: a
+`forge` CLI (init/run/doctor/serve/sensors/datasets/lineage/verify/
+recover, all thin clients over the same v2.6 run-execution and v1-v2.5
+catalog services), a local React/TypeScript GUI served same-origin by
+the existing FastAPI app, a Results Explorer resolving a completed
+run's package/QC/splits/files/lineage fingerprint without ever reading
+split-file contents, a path-safe "Open Output Folder" action, and a
+wheel whose schemas and built frontend are bundled *inside* the `app`
+package (resolved via `importlib.resources`, not a repo-root path) so
+they work identically from a source checkout and from an installed
+wheel run from an arbitrary directory. Verified with a genuine
+clean-room install: a fresh venv outside the repository, `pip install`
+from the built wheel, `forge init`/`doctor`/`sensors`/`config
+validate`/`run`/`serve` all working with schemas and the built GUI
+loading from inside `site-packages`, plus `uv tool install`/`uv tool
+run` working the same way (`pipx` was not available in this
+environment — reported honestly rather than assumed). Live GUI demos
+covered a successful multimodal run through Results/QC/Lineage, a real
+structured failure with no traceback, a genuine mid-flight cancellation
+triggered against a real running stage (a 1.5M-row two-stream run,
+cancelled via the same `POST .../cancel` endpoint the button calls,
+correctly reflected as `cancelled` with prior-stage artifacts retained and
+no partial package), dataset registration, and a governance-affected
+dataset version rendered as "Affected: `<reason>`" without hiding the
+version.
 
-1101 tests in the default suite, plus an opt-in `tests/load/` suite (15
+1139 tests in the default suite, plus an opt-in `tests/load/` suite (15
 tests, `pytest -m load`) exercising real memory measurement at up to
 1,000,000-row scale plus the v2.6 write-amplification measurement, plus
 an opt-in `tests/concurrency/` suite (26 tests, `pytest -m concurrency`)
-exercising real multiprocess contention. No Step 11 work has been
-started or planned as part of this build.
+exercising real multiprocess contention, plus a separate frontend suite
+(21 tests, `cd frontend && npm test`). No Step 11 work has been started
+or planned as part of this build.

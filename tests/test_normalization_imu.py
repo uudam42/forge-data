@@ -13,8 +13,9 @@ from app.normalization.profiles.base import RecordNormalizer
 from app.normalization.profiles.imu import IMU_CANONICAL_V1
 from app.normalization.transforms.fields import AmbiguousFieldMappingError
 from app.validation.schemas.registry import SchemaRegistry
+from app.core.config import _default_schema_dir
 
-SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas"
+SCHEMA_DIR = _default_schema_dir()
 
 
 @pytest.fixture

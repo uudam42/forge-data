@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.core.config import Settings
+from app.core.config import Settings, _default_schema_dir
 from app.runs.cancellation import CancellationToken
 from app.runs.errors import RunCancellationRequested
 from app.runs.executor import PipelineRunner, StreamFile
@@ -40,7 +40,7 @@ def test_cancel_requested_before_start_yields_cancelled_run_with_no_artifacts(tm
         SYNCHRONIZED_STORAGE_ROOT=tmp_path / "synchronized", CLEANED_STORAGE_ROOT=tmp_path / "cleaned",
         TRANSFORMED_STORAGE_ROOT=tmp_path / "transformed", QC_STORAGE_ROOT=tmp_path / "qc",
         PACKAGE_STORAGE_ROOT=tmp_path / "packages", CATALOG_DB_PATH=tmp_path / "catalog" / "catalog.db",
-        SCHEMA_DIR=Path(__file__).resolve().parent.parent / "schemas",
+        SCHEMA_DIR=_default_schema_dir(),
     )
     conn = get_connection(settings.CATALOG_DB_PATH)
     repo = RunRepository(conn)
@@ -177,7 +177,7 @@ def test_the_stage_where_cancellation_is_first_observed_becomes_cancelled_not_st
         SYNCHRONIZED_STORAGE_ROOT=tmp_path / "synchronized", CLEANED_STORAGE_ROOT=tmp_path / "cleaned",
         TRANSFORMED_STORAGE_ROOT=tmp_path / "transformed", QC_STORAGE_ROOT=tmp_path / "qc",
         PACKAGE_STORAGE_ROOT=tmp_path / "packages", CATALOG_DB_PATH=tmp_path / "catalog" / "catalog.db",
-        SCHEMA_DIR=Path(__file__).resolve().parent.parent / "schemas",
+        SCHEMA_DIR=_default_schema_dir(),
     )
     conn = get_connection(settings.CATALOG_DB_PATH)
     repo = RunRepository(conn)
@@ -251,7 +251,7 @@ def test_real_cancellation_token_actually_stops_a_run_requested_mid_flight(tmp_p
         SYNCHRONIZED_STORAGE_ROOT=tmp_path / "synchronized", CLEANED_STORAGE_ROOT=tmp_path / "cleaned",
         TRANSFORMED_STORAGE_ROOT=tmp_path / "transformed", QC_STORAGE_ROOT=tmp_path / "qc",
         PACKAGE_STORAGE_ROOT=tmp_path / "packages", CATALOG_DB_PATH=tmp_path / "catalog" / "catalog.db",
-        SCHEMA_DIR=Path(__file__).resolve().parent.parent / "schemas",
+        SCHEMA_DIR=_default_schema_dir(),
     )
     conn = get_connection(settings.CATALOG_DB_PATH)
     repo = RunRepository(conn)

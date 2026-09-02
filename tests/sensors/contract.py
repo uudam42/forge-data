@@ -7,12 +7,12 @@ itself (no test_ prefix), imported by the ones that are.
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
+from app.core.config import _default_schema_dir
 from app.sensors.base import SensorPlugin
 from app.validation.schemas.registry import SchemaRegistry
 
-SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "schemas"
+SCHEMA_DIR = _default_schema_dir()
 
 
 def assert_plugin_contract(plugin: SensorPlugin, registry_sensor_types: list[str]) -> None:

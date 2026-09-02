@@ -12,9 +12,10 @@ import pytest
 from app.validation.schemas.registry import SchemaRegistry
 from app.validation.validators.base import ErrorAccumulator
 from app.validation.validators.csv_validator import CsvValidator
+from app.core.config import _default_schema_dir
 from tests.load.memory_utils import format_bytes, measure_peak_rss
 
-_SCHEMA_DIR = Path(__file__).resolve().parent.parent.parent / "schemas"
+_SCHEMA_DIR = _default_schema_dir()
 _BASE_TIME = datetime(2026, 8, 30, 0, 0, 0, tzinfo=timezone.utc)
 
 

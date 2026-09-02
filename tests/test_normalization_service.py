@@ -22,8 +22,9 @@ from app.normalization.profiles.gps import GPS_CANONICAL_V1
 from app.normalization.profiles.imu import IMU_CANONICAL_V1
 from app.normalization.transforms.timestamps import normalize_timestamp
 from app.validation.schemas.registry import SchemaRegistry
+from app.core.config import _default_schema_dir
 
-SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schemas"
+SCHEMA_DIR = _default_schema_dir()
 
 
 @pytest.fixture
