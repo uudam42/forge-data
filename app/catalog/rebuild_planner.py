@@ -28,6 +28,19 @@ from app.catalog.serialization import compute_lineage_fingerprint
 # their config genuinely cannot be reconstructed -- Design Requirement
 # 17 requires being honest about that rather than pretending otherwise.
 AUTO_RECONSTRUCTABLE_STAGES = frozenset({"synchronization"})
+
+# app.catalog.rebuild_executor only has an execution path for these
+# stage types (every downstream step in a plan must be one of these to
+# be auto-executable at all). Since a replacement's `old_type` becomes
+# the plan's root and every step is a stage *downstream* of it, the only
+# roots that can ever produce an all-executable plan are these same
+# types plus "normalization" (whose descendants are always drawn from
+# this set) -- "ingestion", "validation", and "integrity" would always
+# produce a plan whose first step has no executor at all. Rejected here,
+# at planning time, rather than discovered only after `execute` fails on
+# step one with a confusing "no rebuild executor is defined" error.
+_EXECUTABLE_STAGE_TYPES = frozenset({"synchronization", "cleaning", "transformation", "qc", "package"})
+SUPPORTED_REPLACEMENT_ANCHOR_TYPES = _EXECUTABLE_STAGE_TYPES | {"normalization"}
 MANUAL_CONFIG_STAGES = frozenset({"cleaning", "transformation", "qc", "package"})
 
 
@@ -69,6 +82,14 @@ class SelectiveRebuildPlanner:
     # ------------------------------------------------------------------
 
     def _check_compatibility(self, *, old_type: str, old_id: str, new_type: str, new_id: str) -> tuple[dict, dict]:
+        if old_type not in SUPPORTED_REPLACEMENT_ANCHOR_TYPES:
+            raise RebuildReplacementIncompatibleError(
+                old_type=old_type, old_id=old_id, new_type=new_type, new_id=new_id,
+                reason=f"selective rebuild does not support replacing a '{old_type}' artifact -- "
+                f"the earliest supported replacement point is 'normalization' (fix the ingestion's "
+                f"normalization output, or replace one of {sorted(_EXECUTABLE_STAGE_TYPES)} directly); "
+                f"a bad raw ingestion requires a full new pipeline run, not a selective rebuild",
+            )
         old = self._repo.get_artifact(old_type, old_id)
         if old is None:
             raise ArtifactNotFoundError(f"No {old_type} artifact with id '{old_id}' (the artifact being replaced)")

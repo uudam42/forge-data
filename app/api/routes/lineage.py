@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.routes.catalog import get_catalog_service
-from app.catalog.errors import ArtifactNotFoundError, InvalidArtifactTypeError
+from app.catalog.errors import ArtifactNotFoundError, CatalogScanFailedError, InvalidArtifactTypeError
 from app.catalog.governance_models import EnrichedImpactResponse
 from app.catalog.models import ImpactResponse, LineageGraphResponse
 from app.catalog.service import CatalogService
@@ -32,7 +32,10 @@ async def get_lineage(
     except ArtifactNotFoundError:
         # v2.7: see app.api.routes.catalog.verify_artifact -- same
         # scan-once-and-retry pattern for a not-yet-indexed artifact.
-        service.scan()
+        try:
+            service.scan()
+        except CatalogScanFailedError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         try:
             return service.lineage(artifact_type, artifact_id, direction=direction, max_depth=max_depth)
         except ArtifactNotFoundError as exc:

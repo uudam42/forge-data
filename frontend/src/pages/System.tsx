@@ -24,7 +24,11 @@ export function System() {
         <h3>Backend health</h3>
         {health === null && !healthError && <Spinner label="Checking..." />}
         <ErrorMessage error={healthError} />
-        {health && <p>Status: <strong>{health.status}</strong></p>}
+        {health && (
+          <p>
+            Status: <strong>{health.status}</strong> &middot; Version: <strong>{health.version}</strong>
+          </p>
+        )}
       </section>
 
       <section className="card">

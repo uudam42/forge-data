@@ -243,6 +243,7 @@ export interface LineageGraphResponse {
 
 export interface HealthResponse {
   status: string;
+  version: string;
 }
 
 export type ApiErrorDetail = string | Record<string, unknown>;

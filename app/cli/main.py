@@ -5,8 +5,8 @@ layer directly (`app.runs`, `app.catalog`, `app.sensors`,
 `app.storage.recovery`) or, for `forge serve`, starts the same FastAPI app
 the HTTP API uses. No pipeline stage logic is implemented here.
 
-Single-action commands (init/sensors/datasets/lineage/verify/doctor/serve/
-runs) are registered directly as root-level `@app.command(...)`s rather
+Single-action commands (init/sensors/datasets/lineage/verify/doctor/
+rebuild/serve/runs) are registered directly as root-level `@app.command(...)`s rather
 than as one-callback sub-Typer groups -- a Click Group whose only action
 is an `invoke_without_command=True` callback (no real subcommand) mis-
 parses options placed after positional arguments (e.g. `forge init demo
@@ -18,6 +18,8 @@ multiple named subcommands, so they're mounted as real sub-apps via
 
 from __future__ import annotations
 
+import logging
+
 import typer
 
 from app.cli.config_cmd import app as config_app
@@ -25,6 +27,7 @@ from app.cli.datasets_cmd import dataset_app, datasets
 from app.cli.doctor import doctor
 from app.cli.init import init
 from app.cli.lineage_cmd import lineage
+from app.cli.rebuild_cmd import rebuild
 from app.cli.recovery_cmd import app as recovery_app
 from app.cli.run import app as run_app
 from app.cli.runs_list import runs
@@ -44,9 +47,22 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main_callback(
+    ctx: typer.Context,
     version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help="Show the Forge Data version and exit."),
 ) -> None:
-    return
+    # Every command except `serve` runs a pipeline stage/service directly
+    # in this process and reports failures through its own clean,
+    # structured `print_error(...)` + exit-code path -- never through
+    # stdlib logging. Without a handler here, a stage exception's
+    # `logger.exception(...)` call (see app.runs.executor, RUN_STAGE_FAILED)
+    # falls through to Python's default "handler of last resort", which
+    # dumps a raw traceback to stderr ahead of that clean message. `serve`
+    # is exempt: it lazily imports app.main, which calls
+    # app.core.logging.configure_logging(...) to set up real, leveled,
+    # stdout server logs -- and configure_logging no-ops if the root
+    # logger already has a handler, so this must not run for `serve`.
+    if ctx.invoked_subcommand != "serve":
+        logging.getLogger().addHandler(logging.NullHandler())
 
 
 app.command("init", help="Create a Forge Data workspace.")(init)
@@ -55,6 +71,7 @@ app.command("datasets", help="List registered datasets.")(datasets)
 app.command("lineage", help="Show an artifact's lineage graph.")(lineage)
 app.command("verify", help="Verify an artifact's checksums/references.")(verify)
 app.command("doctor", help="Diagnose this workspace.")(doctor)
+app.command("rebuild", help="Rebuild the catalog's artifact index from disk (e.g. after a relocated workspace).")(rebuild)
 app.command("serve", help="Start the Forge Data API + local GUI.")(serve)
 app.command("runs", help="List recent pipeline runs.")(runs)
 

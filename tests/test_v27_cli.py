@@ -398,3 +398,61 @@ def test_serve_warns_on_non_localhost_bind(tmp_path: Path, _restore_environ: Non
     assert result.exit_code == 0
     normalized = " ".join(result.output.lower().split())
     assert "no authentication is implemented" in normalized
+
+
+@pytest.fixture
+def _restore_root_logging():
+    """Release-hardening regression fixture: snapshots and restores the
+    real root logger's handlers/level so these two tests can freely
+    clear/inspect it without leaking state into any other test in this
+    process (CliRunner invokes commands in-process, so logging module
+    state is genuinely global and shared across the whole test session)."""
+    import logging
+
+    root = logging.getLogger()
+    before_handlers = list(root.handlers)
+    before_level = root.level
+    yield
+    root.handlers[:] = before_handlers
+    root.setLevel(before_level)
+
+
+def test_non_serve_command_suppresses_default_traceback_logging(tmp_path: Path, _restore_root_logging: None) -> None:
+    """Release-hardening regression: a stage failure inside `forge run`
+    logs via `logger.exception(...)` (app.runs.executor,
+    RUN_STAGE_FAILED) -- with no handler on the root logger, Python's
+    default "handler of last resort" would print that raw traceback to
+    stderr ahead of the CLI's own clean `failed at stage ...` summary.
+    Every non-`serve` command must leave the root logger with a handler
+    (a NullHandler suffices) so that never happens. Uses `doctor` rather
+    than `sensors` to exercise this: `sensors` intentionally has no
+    `--workspace` option (it just lists the static in-process registry),
+    while `doctor` is workspace-aware and always exits 0 without
+    `--strict`, matching how it's invoked elsewhere in this file."""
+    import logging
+
+    logging.getLogger().handlers.clear()
+    ws = _init_workspace(tmp_path)
+    result = runner.invoke(app, ["doctor", "--workspace", str(ws)])
+    assert result.exit_code == 0, result.output
+    assert any(isinstance(h, logging.NullHandler) for h in logging.getLogger().handlers)
+
+
+def test_serve_command_does_not_preempt_configure_logging(tmp_path: Path, _restore_environ: None, _restore_root_logging: None) -> None:
+    """`serve` must NOT get a NullHandler added ahead of time: app.main's
+    `configure_logging(...)` no-ops if the root logger already has a
+    handler (see app/core/logging.py), so pre-adding one here would
+    silently break `forge serve`'s real, formatted, leveled server logs."""
+    import logging
+
+    logging.getLogger().handlers.clear()
+    ws = _init_workspace(tmp_path)
+    # _init_workspace() invokes `forge init`, a non-serve command, which
+    # correctly installs its own NullHandler via main_callback -- that's
+    # test setup, not what's under test here, so clear it again
+    # immediately before the `serve` invocation being asserted on.
+    logging.getLogger().handlers.clear()
+    with patch("uvicorn.run"):
+        result = runner.invoke(app, ["serve", "--workspace", str(ws), "--port", "8123"])
+    assert result.exit_code == 0, result.output
+    assert not any(isinstance(h, logging.NullHandler) for h in logging.getLogger().handlers)

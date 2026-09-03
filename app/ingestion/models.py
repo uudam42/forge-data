@@ -43,6 +43,7 @@ class Manifest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    version: str
 
 
 def resolve_customer_id(customer_id: str | None) -> str:

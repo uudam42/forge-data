@@ -152,7 +152,10 @@ async def verify_artifact(
         # artifact (e.g. from a just-completed PipelineRun) can
         # legitimately not be indexed yet. Scan once and retry before
         # reporting 404, mirroring app.runs.results's same pattern.
-        service.scan()
+        try:
+            service.scan()
+        except CatalogScanFailedError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         try:
             return service.verify(artifact_type, artifact_id, recursive=recursive)
         except ArtifactNotFoundError as exc:

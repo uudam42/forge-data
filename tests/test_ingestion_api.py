@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import app.ingestion.service as service_module
+from app.version import __version__
 
 UPLOAD_URL = "/api/v1/ingestion/upload"
 
@@ -24,7 +25,7 @@ def _original_path(storage_root: Path, customer_id: str, session_id: str, ingest
 def test_health_endpoint(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "version": __version__}
 
 
 def test_csv_upload_succeeds(client: TestClient) -> None:

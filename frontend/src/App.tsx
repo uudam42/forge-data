@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { Dashboard } from './pages/Dashboard';
 import { NewRun } from './pages/NewRun';
@@ -6,6 +7,7 @@ import { Datasets } from './pages/Datasets';
 import { DatasetDetail } from './pages/DatasetDetail';
 import { LineagePage } from './pages/LineagePage';
 import { System } from './pages/System';
+import { getHealth } from './api/system';
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -18,10 +20,18 @@ function NavItem({ to, label }: { to: string; label: string }) {
 }
 
 export function App() {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getHealth()
+      .then((h) => setVersion(h.version))
+      .catch(() => setVersion(null));
+  }, []);
+
   return (
     <div className="app-shell">
       <nav className="app-nav" aria-label="Main navigation">
-        <h1>Forge Data</h1>
+        <h1>Forge Data{version && <span className="app-version"> v{version}</span>}</h1>
         <ul>
           <NavItem to="/" label="Dashboard" />
           <NavItem to="/runs/new" label="New Run" />

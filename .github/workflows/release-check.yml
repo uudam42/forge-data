@@ -1,0 +1,79 @@
+name: Release check
+
+# Builds and verifies distributable artifacts (frontend + Python wheel/sdist),
+# smoke-tests a clean installation, and runs `twine check`. Never publishes
+# anywhere -- publishing to PyPI or creating a GitHub Release remains an
+# explicit, separate, human-triggered action.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend production assets
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: twine check
+        run: python -m twine check dist/*
+
+      - name: Verify wheel contents (schemas + frontend assets present, no dev/test leakage)
+        run: |
+          set -e
+          WHEEL=$(ls dist/*.whl)
+          python -c "
+          import sys, zipfile
+          wheel = '$WHEEL'
+          names = zipfile.ZipFile(wheel).namelist()
+          required = ['app/resources/schemas/', 'app/web/dist/index.html', '.dist-info/entry_points.txt']
+          for r in required:
+              if not any(r in n for n in names):
+                  print(f'MISSING required content: {r}'); sys.exit(1)
+          excluded = ['tests/', 'node_modules/', 'data/catalog/catalog.db', '.staging']
+          for e in excluded:
+              hits = [n for n in names if e in n]
+              if hits:
+                  print(f'UNEXPECTED content matching {e!r}: {hits}'); sys.exit(1)
+          print('wheel contents OK')
+          "
+
+      - name: Install wheel into a clean venv and smoke-test the CLI
+        run: |
+          set -e
+          python -m venv /tmp/release_check_venv
+          /tmp/release_check_venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/release_check_venv/bin/forge --version
+          /tmp/release_check_venv/bin/forge --help
+          /tmp/release_check_venv/bin/forge init smoke_ws
+          cd smoke_ws
+          /tmp/release_check_venv/bin/forge doctor
+          /tmp/release_check_venv/bin/forge sensors
+          /tmp/release_check_venv/bin/forge config validate pipelines/example.yaml
+          /tmp/release_check_venv/bin/forge run pipelines/example.yaml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

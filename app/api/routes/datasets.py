@@ -26,6 +26,7 @@ from app.catalog.errors import (
     ArtifactDeprecatedError,
     ArtifactInvalidError,
     CatalogBusyError,
+    CatalogScanFailedError,
     DatasetNotFoundError,
     DatasetVersionImmutableError,
     DatasetVersionNotFoundError,
@@ -102,7 +103,10 @@ async def register_version(
         # v2.7: see app.api.routes.catalog.verify_artifact -- same
         # scan-once-and-retry pattern for a not-yet-indexed package (e.g.
         # from a just-completed PipelineRun).
-        service.scan()
+        try:
+            service.scan()
+        except CatalogScanFailedError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
         try:
             result, created = _register()
         except PackageNotFoundError as exc:

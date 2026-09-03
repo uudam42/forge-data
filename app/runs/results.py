@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.catalog.errors import CatalogScanFailedError
 from app.catalog.repository import CatalogRepository
 from app.catalog.service import CatalogService
 from app.runs.models import PipelineRunResponse
@@ -73,9 +74,18 @@ class RunResultsService:
             # that run's packaging stage committed. Run the cheap,
             # non-destructive incremental scan once and retry before
             # giving up, so Results doesn't require the user to separately
-            # know to call catalog scan (Design Requirement 30).
-            self._catalog.scan()
-            manifest = _load_metadata(self._repo, "package", package_ref.artifact_id)
+            # know to call catalog scan (Design Requirement 30). A scan
+            # failure (e.g. a relocated workspace tripping the registry's
+            # anti-silent-overwrite guard -- see docs/MIGRATION_V1_TO_V2.md)
+            # falls through to the same resultless response below rather
+            # than raising -- Results is a best-effort, always-200 read
+            # path, never a place that should surface a raw 500.
+            try:
+                self._catalog.scan()
+            except CatalogScanFailedError:
+                pass
+            else:
+                manifest = _load_metadata(self._repo, "package", package_ref.artifact_id)
         if manifest is None:
             # Still missing after a scan -- genuinely gone from the index
             # (e.g. manual data/ tampering). Report a resultless run rather

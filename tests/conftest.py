@@ -14,6 +14,43 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings, get_settings
 from app.main import app
 
+_REPO_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def _snapshot_repo_data_dir() -> frozenset[str]:
+    if not _REPO_DATA_DIR.is_dir():
+        return frozenset()
+    return frozenset(str(p.relative_to(_REPO_DATA_DIR)) for p in _REPO_DATA_DIR.rglob("*") if p.is_file())
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _assert_real_data_dir_untouched():
+    """Permanent regression guard for the real test-isolation bug found
+    during v2.6/v2.7 hardening: a FastAPI `@app.on_event("startup")`
+    handler that closed over a module-level `settings` (bound once at
+    import time, blind to `app.dependency_overrides`) silently touched
+    the real project `data/catalog/catalog.db` on every test using the
+    `client` fixture, since `TestClient(app)` used as a context manager
+    fires startup events. Fixed by resolving settings through
+    `app.dependency_overrides` at call time (see `app.main`'s startup
+    handler) -- this fixture is the automated tripwire that would catch
+    a reintroduction of that bug (or any other one with the same
+    symptom) without requiring a manual `find data -type f` spot-check
+    after every test run.
+    """
+    before = _snapshot_repo_data_dir()
+    yield
+    after = _snapshot_repo_data_dir()
+    assert after == before, (
+        "The test suite touched the real repository data/ directory -- "
+        f"added: {sorted(after - before)}, removed: {sorted(before - after)}. "
+        "Every test must route storage through tmp_path-based Settings "
+        "(see the `test_settings`/`client` fixtures above); a real "
+        "app.dependency_overrides bypass (e.g. a FastAPI startup/shutdown "
+        "event closing over a module-level Settings instead of resolving "
+        "it via the override) is the most likely cause."
+    )
+
 
 @pytest.fixture
 def storage_root(tmp_path: Path) -> Path:

@@ -8,7 +8,7 @@ from typing import Optional
 
 import typer
 
-from app.catalog.errors import ArtifactNotFoundError, InvalidArtifactTypeError
+from app.catalog.errors import ArtifactNotFoundError, CatalogScanFailedError, InvalidArtifactTypeError
 from app.cli.output import console, print_error, print_json
 from app.cli.services import build_catalog_service
 from app.cli.workspace import resolve_settings_or_exit
@@ -29,7 +29,15 @@ def verify(
         # (see app.runs.results for the same pattern) -- a real, just-
         # produced artifact can legitimately not be indexed yet. Scan
         # once and retry before reporting "not found".
-        catalog_service.scan()
+        try:
+            catalog_service.scan()
+        except CatalogScanFailedError as exc:
+            # A relocated workspace can trip the registry's anti-silent-
+            # overwrite guard (a stale absolute manifest_uri) -- see
+            # docs/MIGRATION_V1_TO_V2.md. A full rebuild recovers; a plain
+            # scan does not. Report this clearly rather than a traceback.
+            print_error(f"{exc} -- a catalog rebuild may be required (see docs/MIGRATION_V1_TO_V2.md)")
+            raise typer.Exit(code=1) from exc
         try:
             result = catalog_service.verify(artifact_type, artifact_id, recursive=recursive)
         except (InvalidArtifactTypeError, ArtifactNotFoundError) as exc:

@@ -14,6 +14,7 @@ from app.cli.workspace import resolve_settings_or_exit
 from app.catalog.errors import (
     ArtifactDeprecatedError,
     ArtifactInvalidError,
+    CatalogScanFailedError,
     DatasetNotFoundError,
     DatasetVersionImmutableError,
     InvalidDatasetVersionError,
@@ -102,6 +103,13 @@ def dataset_register(
         UpstreamArtifactDeprecatedError,
     ) as exc:
         print_error(str(exc))
+        raise typer.Exit(code=1) from exc
+    except CatalogScanFailedError as exc:
+        # A relocated workspace can trip the registry's anti-silent-
+        # overwrite guard (a stale absolute manifest_uri) -- see
+        # docs/MIGRATION_V1_TO_V2.md. A full rebuild recovers; a plain
+        # scan does not.
+        print_error(f"{exc} -- a catalog rebuild may be required (see docs/MIGRATION_V1_TO_V2.md)")
         raise typer.Exit(code=1) from exc
 
     if as_json:

@@ -2,6 +2,7 @@
 name = "forge-data"
 dynamic = ["version"]
 description = "Local-first robotics / physical AI / multimodal sensor data pipeline platform"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.110",

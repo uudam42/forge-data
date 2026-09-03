@@ -5,9 +5,11 @@ layer and HTTP API documented in `docs/DETAILED_GUIDE.md` — see its
 "Local CLI and GUI (v2.7)" section for the architecture. This document
 is the practical command-by-command reference.
 
-Install: `pip install forge-data` (or, for development, `pip install
--e ".[dev]"` from a source checkout — both give you a real `forge`
-console command; `python -m app.cli.main` is never required).
+Install: Forge Data is not yet published to PyPI, so `pip install
+forge-data` is aspirational for now — install from a locally built
+wheel (`pip install dist/*.whl`) or, for development, `pip install
+-e ".[dev]"` from a source checkout. Either way you get a real `forge`
+console command; `python -m app.cli.main` is never required.
 
 ## Workspace resolution
 
@@ -168,6 +170,40 @@ supported, never a hard failure). `--strict` exits non-zero if any
 forge doctor
 forge doctor --strict   # exit 4 if unhealthy
 forge doctor --json | jq '.checks[] | select(.ok == false)'
+```
+
+## `forge rebuild [--json]`
+
+Rebuilds the catalog's artifact index and lineage edges from the
+artifacts actually present on disk (the same operation
+`POST /api/v1/catalog/rebuild` performs over HTTP, callable here without
+starting `forge serve`). Datasets, dataset versions, and all governance/
+run metadata are user-registered/operational catalog state, not
+reconstructible from stage manifests, and are never touched — only the
+artifact/lineage index is reconstructed.
+
+This is the fix for `CatalogScanFailedError` (the message every
+`.scan()`-then-retry command prints points back to
+`docs/MIGRATION_V1_TO_V2.md`, "Relocated workspaces") — an incremental
+scan refuses to silently overwrite a registered artifact's
+`manifest_uri` when a workspace has moved to a different filesystem
+path; a full rebuild re-derives the index from what's on disk instead
+and recovers cleanly. Obeys the same v2.4 exclusive rebuild lock as the
+HTTP route: if another process already holds it, this fails immediately
+with a clean `CATALOG_REBUILD_IN_PROGRESS` message and exit code 1,
+never a hang.
+
+```bash
+forge rebuild --workspace <path>
+```
+
+```
+Catalog rebuild completed
+
+Artifacts registered: 13
+Edges registered: 13
+Datasets preserved: 1
+Dataset versions preserved: 1
 ```
 
 ## `forge serve [--host 127.0.0.1] [--port 8000] [--open-browser]`

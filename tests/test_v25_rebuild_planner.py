@@ -84,6 +84,21 @@ def test_multiparent_dag_topological_order_and_selective_reuse(repo: CatalogRepo
     assert all(p.replaced for p in package_step.parents)  # both transformation and qc are downstream of the replaced normalization
 
 
+def test_replacement_anchor_before_normalization_is_rejected_at_plan_time(repo: CatalogRepository) -> None:
+    """Release-hardening regression: app.catalog.rebuild_executor has no
+    execution path for validation/integrity/ingestion stages, so a plan
+    anchored earlier than 'normalization' can never actually execute --
+    it used to build "successfully" (every step marked feasible=true)
+    only to fail at execute time on step one with a confusing "no
+    rebuild executor is defined" error. Now rejected up front, at plan
+    time, with an actionable message."""
+    with repo.transaction():
+        _add(repo, "ingestion", "ing_old", 1, session_id="s1")
+        _add(repo, "ingestion", "ing_new", 1, session_id="s1")
+    with pytest.raises(RebuildReplacementIncompatibleError, match="does not support replacing a 'ingestion'"):
+        SelectiveRebuildPlanner(repo).build_plan(old_type="ingestion", old_id="ing_old", new_type="ingestion", new_id="ing_new")
+
+
 def test_incompatible_replacement_different_type(repo: CatalogRepository) -> None:
     with repo.transaction():
         _add(repo, "normalization", "n_old", 4)

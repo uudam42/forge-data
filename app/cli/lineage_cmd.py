@@ -8,7 +8,7 @@ from typing import Optional
 import typer
 from rich.tree import Tree
 
-from app.catalog.errors import ArtifactNotFoundError, InvalidArtifactTypeError
+from app.catalog.errors import ArtifactNotFoundError, CatalogScanFailedError, InvalidArtifactTypeError
 from app.cli.output import console, print_error, print_json
 from app.cli.services import build_catalog_service
 from app.cli.workspace import resolve_settings_or_exit
@@ -30,7 +30,11 @@ def lineage(
         # See app.runs.results / app.cli.verify_cmd for why: the artifact
         # index is populated by an explicit scan, not written live by
         # each stage -- scan once and retry before reporting "not found".
-        catalog_service.scan()
+        try:
+            catalog_service.scan()
+        except CatalogScanFailedError as exc:
+            print_error(f"{exc} -- a catalog rebuild may be required (see docs/MIGRATION_V1_TO_V2.md)")
+            raise typer.Exit(code=1) from exc
         try:
             graph = catalog_service.lineage(artifact_type, artifact_id, direction=direction, max_depth=max_depth)
         except (InvalidArtifactTypeError, ArtifactNotFoundError) as exc:

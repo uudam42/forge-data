@@ -5,11 +5,11 @@
 
 **Reproducible data infrastructure for robotics and Physical AI.**
 
-**v1.0** · English · [中文](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
+**v2.0** · English · [中文](README.zh-CN.md) · [Full Technical Guide](docs/DETAILED_GUIDE.md)
 
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
-![Tests](https://img.shields.io/badge/tests-878%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-1144%20passing-brightgreen)
 
 <!-- No banner asset is committed to this repository yet. -->
 
@@ -19,10 +19,10 @@ for robotics and Physical AI workflows, where independently-clocked streams like
 have to move through deterministic, auditable preprocessing before they're trainable — and
 where you need to be able to answer "where did this exact dataset come from?" months later.
 
-## Forge Data v1.0
+## Forge Data v2.0
 
-v1.0 is the first complete release of the local core pipeline — a single, coherent chain
-from raw upload to a versioned, lineage-tracked dataset:
+Forge Data is a local-first pipeline platform that takes raw sensor uploads all the way to a
+versioned, ML-ready dataset package:
 
 ```
 Ingestion → Validation → Integrity → Normalization → Synchronization
@@ -30,8 +30,16 @@ Ingestion → Validation → Integrity → Normalization → Synchronization
    → Global Lineage & Dataset Registry
 ```
 
-Every stage in that chain is implemented, tested, and wired together end to end — see
-[Status](#status) for what that guarantees today and what's intentionally out of scope.
+Every stage in that chain is crash-safe, deterministic, and lineage-tracked, and the whole
+pipeline is reachable from an installable CLI and local GUI — no source checkout required.
+On top of the core pipeline, v2.0 adds: crash-safe atomic artifacts and recovery, large-data
+resource bounds (validated to 1M+ rows), a composable sensor plugin architecture (IMU, GPS,
+Force/Torque built in), a multiprocess-safe catalog, governance-aware lineage with selective
+rebuild, durable pipeline runs with progress and cancellation, and a `forge` CLI + local GUI
+with a Results Explorer. See [CHANGELOG.md](CHANGELOG.md) for the full history and
+[docs/RELEASE_NOTES_V2.md](docs/RELEASE_NOTES_V2.md) for the complete feature tour, usage,
+and known limitations. Upgrading from v1.0? See
+[docs/MIGRATION_V1_TO_V2.md](docs/MIGRATION_V1_TO_V2.md).
 
 ## Why Forge Data?
 
@@ -137,48 +145,57 @@ deleted and fully reconstructed from the filesystem manifests any stage already 
 
 ## Quick start
 
+Forge Data is not yet published to PyPI — install it from a built wheel or directly from
+source (see [Running from source](#running-from-source) below). Once installed, the workflow
+is the same either way. Initialize a workspace and run the built-in example pipeline
+(IMU + GPS):
+
+```bash
+forge init demo && cd demo
+forge run pipelines/example.yaml
+```
+
+That produces a versioned, ML-ready package: leakage-safe train/validation/test splits
+(JSONL), a dataset QC report, and a full lineage trail back to the original raw uploads —
+all registered in the local catalog and inspectable with `forge datasets`, `forge lineage`,
+and `forge verify`.
+
+Prefer a GUI? `forge serve` starts the same pipeline behind a local browser UI at
+`http://127.0.0.1:8000`:
+
+```bash
+forge serve
+```
+
+From there you can submit a run, watch live progress, cancel it if needed, and open the
+Results Explorer to inspect the final package, QC report, dataset registration, and lineage
+— all backed by the same local API the CLI uses. Full CLI reference: [docs/CLI.md](docs/CLI.md).
+
+### Running from source
+
 ```bash
 git clone https://github.com/uudam42/forge-data.git
 cd forge-data
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-
-uvicorn app.main:app --reload
 pytest
+
+forge init demo && cd demo && forge run pipelines/example.yaml
 ```
 
-Interactive API docs (Swagger UI) are served at **http://localhost:8000/docs** — every
-endpoint can be explored and called from the browser without writing a single curl command.
-
-Minimal example — upload a raw file:
+Or build and install a wheel (this also builds the frontend and bundles it into the
+package, so the GUI works from the installed wheel with no separate `npm` step):
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/ingestion/upload \
-  -F "file=@imu.csv" -F "customer_id=demo" -F "device_id=imu_001"
-# -> { "ingestion_id": "ing_...", "status": "stored", "sha256": "...", ... }
+cd frontend && npm ci && npm run build && cd ..
+python -m build
+pip install dist/forge_data-*.whl
 ```
 
-The full 10-stage curl walkthrough is in the [Full Technical Guide](docs/DETAILED_GUIDE.md).
-
-### Product quick start (CLI + local GUI)
-
-The 10-stage API above is what the pipeline runs on; you don't have to
-call it by hand. v2.7 adds a `forge` CLI and a local browser GUI on top
-of it — install (or `pip install -e .` from this checkout), then:
-
-```bash
-forge init demo && cd demo
-forge run pipelines/example.yaml     # or: forge serve, then open http://127.0.0.1:8000
-```
-
-`forge serve` starts the API and a local GUI (Dashboard, New Run, Run
-Detail, a Results Explorer, Datasets, Lineage) at `http://127.0.0.1:8000` —
-local-process execution with durable run metadata, not a distributed job
-queue. From there you can start a pipeline run, watch it progress, cancel
-it if needed, and inspect the final package, QC report, and lineage
-without touching the filesystem or Swagger UI directly. Full CLI command
-reference: [docs/CLI.md](docs/CLI.md); architecture:
-[docs/DETAILED_GUIDE.md#local-cli-and-gui-v27](docs/DETAILED_GUIDE.md#local-cli-and-gui-v27).
+The underlying HTTP API (used by both the CLI and GUI) also has interactive Swagger docs at
+**http://127.0.0.1:8000/docs** when `forge serve` is running — every endpoint can be explored
+and called from the browser directly. The full curl-by-curl API walkthrough is in the
+[Full Technical Guide](docs/DETAILED_GUIDE.md#end-to-end-demo).
 
 ## API surface
 
@@ -248,7 +265,7 @@ robotics_demo @ 1.0.0
 
 ## Testing
 
-1139 tests currently cover per-stage behavior, lineage gates, determinism, artifact
+1144 tests currently cover per-stage behavior, lineage gates, determinism, artifact
 immutability, checksum validation, API contracts, crash-safety/atomic-commit
 guarantees (including real subprocess kill tests), sensor plugin contracts (IMU, GPS,
 Force/Torque), pipeline runs/cancellation, and the `forge` CLI, plus full end-to-end
@@ -284,7 +301,7 @@ app/
   cli/                `forge` CLI commands (v2.7)
   web/                Built frontend, bundled as package data (v2.7)
 frontend/             React/TypeScript/Vite GUI source (v2.7)
-tests/                1139 tests (+ opt-in tests/load/, 15, and tests/concurrency/, 26)
+tests/                1144 tests (+ opt-in tests/load/, 15, and tests/concurrency/, 26)
 app/resources/schemas/   Built-in IMU / GPS / Force-Torque schema definitions (bundled package resource)
 docs/DETAILED_GUIDE.md   Full architecture, API, and error-code reference
 docs/ADDING_SENSOR.md   Step-by-step guide to adding a new sensor plugin
@@ -292,87 +309,26 @@ docs/ADDING_SENSOR.md   Step-by-step guide to adding a new sensor plugin
 
 ## Status
 
-**Current release: Forge Data v1.0**
+**Current release: Forge Data v2.0**
 
-The v1.0 core pipeline is complete and validated end-to-end, with:
+The full pipeline — ingestion through packaging, catalog, and dataset registry — is
+implemented, tested, and reachable from a CLI, a local GUI, and the HTTP API directly, with:
 
-- immutable per-stage artifacts
-- deterministic transformations
-- dataset-level QC
-- leakage-safe packaging
-- global lineage
-- a dataset version registry
+- crash-safe, atomically-published artifacts and staging recovery
+- large-data resource bounds, validated up to 1M+ rows
+- a composable sensor plugin architecture (IMU, GPS, Force/Torque built in)
+- a multiprocess-safe catalog (WAL mode, race-safe registration, exclusive rebuild locking)
+- governance-aware lineage with selective rebuild
+- durable pipeline runs with progress, cooperative cancellation, and crash reconciliation
+- an installable `forge` CLI and local GUI, including a Results Explorer
 
-v2 development:
-- v2.1 Crash Safety & Atomic Artifacts — COMPLETE
-- v2.2 Large-scale Streaming & Resource Bounds — COMPLETE
-- v2.3 Sensor / Schema Plugin System — COMPLETE
-- v2.4 Multiprocess Concurrency & SQLite Safety — COMPLETE
-- v2.5 Data Governance & Selective Rebuild — COMPLETE
-- v2.6 Pipeline Runs, Progress, Cancellation & Observability — COMPLETE
-- v2.7 Local CLI, GUI, Results Explorer & Distribution — COMPLETE
-
-**v2.1 (Crash Safety & Atomic Artifacts)** adds a cross-cutting reliability guarantee on top
-of v1.0: every derived artifact is staged and published atomically, so a crashed or killed
-process can never leave a partial artifact where a finalized one is expected. Details:
-[Full Technical Guide § Crash consistency and atomic artifacts](docs/DETAILED_GUIDE.md#crash-consistency-and-atomic-artifacts-v21).
-
-**v2.2 (Large-scale Streaming & Resource Bounds)** documents a resource contract for every
-stage, adds a scalable SQLite-backed exact-dedup option for cleaning (the default in-memory
-backend's O(unique_rows) growth is now measured and documented, not just claimed), and adds
-disk-space preflight checks before large writes. Details:
-[Full Technical Guide § Large-data execution and resource model](docs/DETAILED_GUIDE.md#large-data-execution-and-resource-model-v22).
-
-**v2.3 (Sensor / Schema Plugin System)** turns IMU, GPS, and a new built-in 6-axis
-Force/Torque sensor into a coherent `SensorPlugin` architecture — adding a sensor is one
-plugin package and one registration line, with zero changes to synchronization, cleaning,
-QC, packaging, or catalog code (verified by an automated source-text check). See
-[docs/ADDING_SENSOR.md](docs/ADDING_SENSOR.md) for the practical guide, or
-[Full Technical Guide § Sensor plugin architecture](docs/DETAILED_GUIDE.md#sensor-plugin-architecture-v23) for the design.
-
-**v2.4 (Multiprocess Concurrency & SQLite Safety)** makes the catalog safe when several
-local processes on the same machine — multiple `uvicorn` workers, concurrent pipeline
-requests, independent scripts — share one workspace and one `catalog.db`: verified WAL
-journaling, a bounded busy timeout with a structured error, race-safe (database-constraint-
-authoritative) artifact/dataset/version registration, and an OS-level exclusive rebuild lock.
-This is single-machine, multiprocess-safe local catalog access — not a distributed or
-cross-machine database. Details:
-[Full Technical Guide § Multiprocess concurrency model](docs/DETAILED_GUIDE.md#multiprocess-concurrency-model-v24).
-
-**v2.5 (Data Governance & Selective Rebuild)** turns lineage from passive observability into
-active governance: mark an artifact or dataset version deprecated/invalid (append-only
-history, no manifest ever touched), a downstream-processing gate blocks new work through an
-invalid artifact or ancestor, enriched impact analysis shows each affected dataset version's
-computed status, and a selective-rebuild planner/executor produces a new, corrected lineage
-branch — reusing every unaffected sibling parent unchanged — while the old branch and old
-dataset version stay fully intact and inspectable. This is governance-aware lineage and
-descendant rebuild planning, not automatic repair or a job orchestrator. Details:
-[Full Technical Guide § Data governance and selective rebuild](docs/DETAILED_GUIDE.md#data-governance-and-selective-rebuild-v25).
-
-**v2.6 (Pipeline Runs, Progress, Cancellation & Observability)** adds a first-class,
-durable `PipelineRun`/`StageRun` execution model: submit a multi-stream (IMU/GPS/Force-Torque)
-pipeline as one run, poll its status/progress/produced artifacts, request cooperative
-cancellation, and see a v2.5 selective rebuild's own observable run record. Progress and
-structured execution status are honest and throttled — never a fabricated percentage — and a
-process crash is reconciled to a clean failed state at the next startup, never an automatic
-resume. This is local-process execution with durable run metadata, not a distributed job
-queue. Details:
-[Full Technical Guide § Pipeline runs and observability](docs/DETAILED_GUIDE.md#pipeline-runs-and-observability-v26).
-
-**v2.7 (Local CLI, GUI, Results Explorer & Distribution)** turns the platform into an
-installable product: a `forge` CLI, a local browser GUI served by the existing FastAPI
-app, a Results Explorer that resolves a completed run's package/QC/splits/lineage
-without ever reading split-file contents, and a wheel whose schemas and built frontend
-are bundled inside the package so they work identically from a source checkout and an
-installed wheel run from anywhere. This is local-process execution with durable run
-metadata, not a distributed job queue. Details:
-[Full Technical Guide § Local CLI and GUI](docs/DETAILED_GUIDE.md#local-cli-and-gui-v27) ·
-[CLI command reference](docs/CLI.md).
+See [CHANGELOG.md](CHANGELOG.md) for what shipped in each development milestone, and
+[docs/RELEASE_NOTES_V2.md](docs/RELEASE_NOTES_V2.md) for the full architecture tour and
+honestly-documented known limitations.
 
 The current implementation is **local-first and single-node** — designed for large
 single-machine workloads, not distributed/cloud scale. Cloud storage, orchestration,
-authentication, multi-tenancy, and a web dashboard are planned for the next phase — see
-[Roadmap](#roadmap).
+authentication, and multi-tenancy are tracked as future work — see [Roadmap](#roadmap).
 
 ## Current scope
 
@@ -405,6 +361,9 @@ Realistic next steps, not commitments or dates:
 - [Full Technical Guide](docs/DETAILED_GUIDE.md) — architecture, every API and error code, per-stage design notes, MVP limitations
 - [CLI reference](docs/CLI.md) — every `forge` command
 - [Adding a Sensor](docs/ADDING_SENSOR.md) — step-by-step guide to adding a new sensor plugin
+- [Release Notes](docs/RELEASE_NOTES_V2.md) — what's new in v2.0, usage, and known limitations
+- [Migrating from v1.0](docs/MIGRATION_V1_TO_V2.md) — upgrade workflow and compatibility guarantees
+- [CHANGELOG](CHANGELOG.md) — release history
 - [中文文档](README.zh-CN.md)
 
 ## Contributing
